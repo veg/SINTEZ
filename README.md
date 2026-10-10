@@ -108,11 +108,11 @@ The neural DNA backbone (238,407 parameters) was trained **exclusively** on a co
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
 | **P. falciparum Chr 1** (`NC_004325.2`) | Apicomplexa (Protist) | 640,851 bp | 80.64% AT | **+0.8260** | 90.00% | 92.57% | 90.02% | 34.62% (36/104) | **84.62%** (88/104) |
 | **P. falciparum Chr 2** (`NC_037280.1`) | Apicomplexa (Protist) | 947,102 bp | 80.25% AT | **+0.8076** | 89.16% | 91.53% | 90.68% | 37.44% (82/219) | **85.84%** (188/219) |
-| **P. falciparum Chr 3** (`NC_000521.4`) | Apicomplexa (Protist) | 1,067,971 bp | 79.94% AT | **+0.8747** | **94.35%** | **93.09%** | **93.68%** | **49.38%** (119/241) | **80.08%** (193/241) |
+| **P. falciparum Chr 3** (`NC_000521.4`) | Apicomplexa (Protist) | 1,067,971 bp | 79.94% AT | **+0.8780** | **94.73%** | **93.03%** | **93.65%** | **48.96%** (118/241) | **85.89%** (207/241) |
 | **A. thaliana Chr 1 slice** (`NC_003070.9`) | Viridiplantae (Plant) | 500,001 bp | 62.26% AT | **+0.5850** | 46.12% | **91.83%** | 83.74% | 10.54% (31/294) | **73.47%** (216/294) |
 
 > [!NOTE]
-> On *P. falciparum* Chromosome 3 (1.07 Mb), SINTEZ achieved **+0.8747 Base MCC** with **93.68% Precision** and recovered **119 exact gene models (49.38%)** with zero organism-specific fine-tuning.
+> On *P. falciparum* Chromosome 3 (1.07 Mb), SINTEZ achieved **+0.8780 Base MCC** with **93.65% Precision**, recovering **207 gene loci (85.89%)** and **238 exact exons** with zero organism-specific fine-tuning.
 
 ---
 

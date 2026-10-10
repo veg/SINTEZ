@@ -10,11 +10,25 @@ def test_decoder_initialization():
         min_single_len=240,
         min_multi_len=240,
         max_intron_len=1500,
-        max_exons=8,
+        min_internal_exon_len=15,
+        max_exons=16,
+        beam_width=8,
         lambda_intron=4.5,
+        min_intron_gain=-1.5,
     )
-    assert decoder.max_exons == 8
+    assert decoder.max_exons == 16
     assert decoder.lambda_intron == 4.5
+    assert decoder.min_internal_exon_len == 15
+    assert decoder.beam_width == 8
+    assert decoder.min_intron_gain == -1.5
+
+
+def test_decoder_default_parameters():
+    decoder = TopologicalDAGDecoder()
+    assert decoder.max_exons == 16
+    assert decoder.min_internal_exon_len == 15
+    assert decoder.beam_width == 8
+    assert decoder.min_intron_gain == -1.5
 
 
 def test_jacobson_stockmayer_loop_penalty():

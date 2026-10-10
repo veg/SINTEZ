@@ -28,8 +28,11 @@ class TopologicalDAGDecoder:
         min_single_len: int = 240,
         min_multi_len: int = 240,
         max_intron_len: int = 1500,
-        max_exons: int = 8,
+        min_internal_exon_len: int = 15,
+        max_exons: int = 16,
+        beam_width: int = 8,
         lambda_intron: float = 4.5,
+        min_intron_gain: float = -1.5,
         min_donor_prob: float = 0.005,
         min_accept_prob: float = 0.005,
         energy_cutoff: float = 13.0,
@@ -37,8 +40,11 @@ class TopologicalDAGDecoder:
         self.min_single_len = min_single_len
         self.min_multi_len = min_multi_len
         self.max_intron_len = max_intron_len
+        self.min_internal_exon_len = min_internal_exon_len
         self.max_exons = max_exons
+        self.beam_width = beam_width
         self.lambda_intron = lambda_intron
+        self.min_intron_gain = min_intron_gain
         self.min_donor_prob = min_donor_prob
         self.min_accept_prob = min_accept_prob
         self.energy_cutoff = energy_cutoff
@@ -109,29 +115,29 @@ class TopologicalDAGDecoder:
                         })
 
                     # Option B: Extend to donor near stop codon and splice
-                    if depth < self.max_exons and (first_stop - last_end) >= 30:
-                        donor_start = max(last_end + 30, first_stop - 400)
+                    if depth < self.max_exons and (first_stop - last_end) >= self.min_internal_exon_len:
+                        donor_start = max(last_end + self.min_internal_exon_len, first_stop - 400)
                         valid_donors = []
                         for d in range(donor_start, first_stop + 1):
                             if dna_upper[d:d+2] in {"GT", "GC"} and donor_p[d] >= self.min_donor_prob:
                                 valid_donors.append((d, float(donor_p[d])))
                         valid_donors.sort(key=lambda x: x[1], reverse=True)
-                        for d, d_score in valid_donors[:3]:
+                        for d, d_score in valid_donors[:4]:
                             d_phase = (phase + (d - last_end)) % 3
                             valid_a = [(a, float(accept_p[a-1])) for a in range(d + 40, min(L, d + self.max_intron_len)) if a in cand_acceptors]
                             valid_a.sort(key=lambda x: x[1], reverse=True)
-                            for a, a_score in valid_a[:2]:
+                            for a, a_score in valid_a[:3]:
                                 next_spans = spans + [(last_end, d)]
                                 next_len = total_len + (d - last_end)
                                 intron_len = a - d
                                 # Jacobson-Stockmayer polymer looping penalty
                                 loop_penalty = 1.5 * max(0.0, math.log(max(1.0, intron_len / 80.0)))
                                 intron_gain = math.log(1.0 + 100.0 * d_score) + math.log(1.0 + 100.0 * a_score) - self.lambda_intron - loop_penalty
-                                if intron_gain > 0.0:
+                                if intron_gain > self.min_intron_gain:
                                     next_paths.append((next_spans, a, d_phase, exon_count + 1, next_len, junc_score + intron_gain))
 
                 next_paths.sort(key=lambda x: x[5], reverse=True)
-                active_paths = next_paths[:4]
+                active_paths = next_paths[:self.beam_width]
 
             # Pareto Principle: Group by exon count and preserve top candidate of EACH topology
             if completed_for_s:
