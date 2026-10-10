@@ -1,0 +1,188 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="100%" height="100%">
+  <defs>
+    <!-- Metal Rim Gradients -->
+    <linearGradient id="metalRim" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#8E8D8A"/>
+      <stop offset="25%" stop-color="#D8C3A5"/>
+      <stop offset="50%" stop-color="#4A4E51"/>
+      <stop offset="75%" stop-color="#EAE7DC"/>
+      <stop offset="100%" stop-color="#2E3033"/>
+    </linearGradient>
+
+    <linearGradient id="brassBezel" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#F3E5AB"/>
+      <stop offset="30%" stop-color="#D4AF37"/>
+      <stop offset="70%" stop-color="#AA771C"/>
+      <stop offset="100%" stop-color="#5B3E08"/>
+    </linearGradient>
+
+    <!-- Soviet Enamel Cadmium Red -->
+    <radialGradient id="sovietRed" cx="50%" cy="40%" r="60%">
+      <stop offset="0%" stop-color="#D32F2F"/>
+      <stop offset="45%" stop-color="#B71C1C"/>
+      <stop offset="85%" stop-color="#7F0000"/>
+      <stop offset="100%" stop-color="#450000"/>
+    </radialGradient>
+
+    <!-- CRT Phosphor Glow -->
+    <radialGradient id="crtScreen" cx="50%" cy="50%" r="55%">
+      <stop offset="0%" stop-color="#1B3322"/>
+      <stop offset="70%" stop-color="#0F1F15"/>
+      <stop offset="100%" stop-color="#060D08"/>
+    </radialGradient>
+
+    <!-- Drop Shadow for Industrial Depth -->
+    <filter id="badgeShadow" x="-15%" y="-15%" width="130%" height="130%">
+      <feDropShadow dx="4" dy="10" stdDeviation="8" flood-color="#000000" flood-opacity="0.85"/>
+    </filter>
+
+    <filter id="insetShadow" x="-10%" y="-10%" width="120%" height="120%">
+      <feOffset dx="2" dy="4"/>
+      <feGaussianBlur stdDeviation="3" result="offset-blur"/>
+      <feComposite operator="out" in="SourceGraphic" in2="offset-blur" result="inverse"/>
+      <feFlood flood-color="#000" flood-opacity="0.7" result="color"/>
+      <feComposite operator="in" in="color" in2="inverse" result="shadow"/>
+      <feComposite operator="over" in="shadow" in2="SourceGraphic"/>
+    </filter>
+  </defs>
+
+  <!-- Deep Background Shadow -->
+  <g filter="url(#badgeShadow)">
+    <!-- Base Chassis: Heavy Octagonal Stamped Plate -->
+    <polygon points="120,24 392,24 488,120 488,392 392,488 120,488 24,392 24,120"
+             fill="#222629" stroke="url(#metalRim)" stroke-width="8" stroke-linejoin="round"/>
+    
+    <!-- Secondary Inset Plate: Industrial Teal-Slate Machine Enamel -->
+    <polygon points="126,38 386,38 474,126 474,386 386,474 126,474 38,386 38,126"
+             fill="#28363D" stroke="#182226" stroke-width="4"/>
+  </g>
+
+  <!-- Four Heavy Corner Industrial Screws/Rivets -->
+  <!-- Top Left -->
+  <g transform="translate(68, 68)">
+    <circle r="12" fill="url(#metalRim)" stroke="#111" stroke-width="2"/>
+    <circle r="9" fill="#4A4E51"/>
+    <line x1="-7" y1="-7" x2="7" y2="7" stroke="#1A1A1A" stroke-width="3" stroke-linecap="round"/>
+  </g>
+  <!-- Top Right -->
+  <g transform="translate(444, 68)">
+    <circle r="12" fill="url(#metalRim)" stroke="#111" stroke-width="2"/>
+    <circle r="9" fill="#4A4E51"/>
+    <line x1="-7" y1="7" x2="7" y2="-7" stroke="#1A1A1A" stroke-width="3" stroke-linecap="round"/>
+  </g>
+  <!-- Bottom Left -->
+  <g transform="translate(68, 444)">
+    <circle r="12" fill="url(#metalRim)" stroke="#111" stroke-width="2"/>
+    <circle r="9" fill="#4A4E51"/>
+    <line x1="-8" y1="2" x2="8" y2="-2" stroke="#1A1A1A" stroke-width="3" stroke-linecap="round"/>
+  </g>
+  <!-- Bottom Right -->
+  <g transform="translate(444, 444)">
+    <circle r="12" fill="url(#metalRim)" stroke="#111" stroke-width="2"/>
+    <circle r="9" fill="#4A4E51"/>
+    <line x1="-2" y1="-8" x2="2" y2="8" stroke="#1A1A1A" stroke-width="3" stroke-linecap="round"/>
+  </g>
+
+  <!-- The Soviet State Quality Mark Inspired Polygon (Знак Качества) -->
+  <!-- Points: Top, Upper-Right, Lower-Right, Lower-Left, Upper-Left -->
+  <g filter="url(#badgeShadow)">
+    <polygon points="256,52 440,185 370,400 142,400 72,185"
+             fill="url(#sovietRed)" stroke="url(#brassBezel)" stroke-width="9" stroke-linejoin="round"/>
+    
+    <!-- Inner Fine Inset Ridge -->
+    <polygon points="256,66 424,189 359,388 153,388 88,189"
+             fill="none" stroke="#FFA726" stroke-width="2" opacity="0.6"/>
+  </g>
+
+  <!-- Industrial Gear / Escapement Wheel (Brutalist Machine Cog) -->
+  <g transform="translate(256, 215)" opacity="0.35">
+    <circle r="96" fill="none" stroke="#D4AF37" stroke-width="14" stroke-dasharray="16, 12"/>
+    <circle r="80" fill="none" stroke="#FFA726" stroke-width="3"/>
+  </g>
+
+  <!-- Cathode Ray / Oscilloscope Screen Aperture -->
+  <g transform="translate(256, 215)">
+    <circle r="88" fill="url(#crtScreen)" stroke="url(#brassBezel)" stroke-width="6"/>
+    
+    <!-- CRT Grid Lines -->
+    <line x1="-80" y1="0" x2="80" y2="0" stroke="#1B4D2B" stroke-width="1.5" stroke-dasharray="4,4"/>
+    <line x1="0" y1="-80" x2="0" y2="80" stroke="#1B4D2B" stroke-width="1.5" stroke-dasharray="4,4"/>
+    <circle r="44" fill="none" stroke="#1B4D2B" stroke-width="1" stroke-dasharray="3,3"/>
+    
+    <!-- Clanky Geometric DNA Double Helix / Signal Splicing Waveform -->
+    <!-- Top-to-bottom stepped DNA helix rungs -->
+    <g stroke="#00FF66" stroke-width="3" stroke-linecap="square">
+      <!-- Base Pairs (Stepped Rungs) -->
+      <line x1="-36" y1="-55" x2="36" y2="-55"/>
+      <line x1="-50" y1="-38" x2="50" y2="-38"/>
+      <line x1="-28" y1="-20" x2="28" y2="-20"/>
+      <line x1="-6"  y1="0"   x2="6"   y2="0"/>
+      <line x1="-28" y1="20"  x2="28"  y2="20"/>
+      <line x1="-50" y1="38"  x2="50"  y2="38"/>
+      <line x1="-36" y1="55"  x2="36"  y2="55"/>
+
+      <!-- Strand 1 (Sine Phase) -->
+      <polyline points="-36,-55 -50,-38 -28,-20 0,0 28,20 50,38 36,55"
+                fill="none" stroke="#33FF88" stroke-width="4.5" stroke-linejoin="round"/>
+      
+      <!-- Strand 2 (Cosine Phase) -->
+      <polyline points="36,-55 50,-38 28,-20 0,0 -28,20 -50,38 -36,55"
+                fill="none" stroke="#FFD54F" stroke-width="3.5" stroke-linejoin="round"/>
+
+      <!-- Splice Junction Signal Pulse / Phosphor Spark -->
+      <circle cx="0" cy="0" r="5" fill="#FFFFFF"/>
+      <circle cx="0" cy="0" r="10" fill="none" stroke="#00FF66" stroke-width="2" opacity="0.8"/>
+    </g>
+
+    <!-- CRT Scanline Overlay -->
+    <rect x="-85" y="-85" width="170" height="170" fill="none"
+          stroke="#000000" stroke-width="1" stroke-dasharray="1,2" opacity="0.35"/>
+  </g>
+
+  <!-- Soviet Banner Plaque for Typography -->
+  <g transform="translate(256, 350)" filter="url(#badgeShadow)">
+    <!-- Beveled Metal Nameplate Plaque -->
+    <rect x="-140" y="-24" width="280" height="48" rx="4"
+          fill="#1C2124" stroke="url(#brassBezel)" stroke-width="4"/>
+    <rect x="-136" y="-20" width="272" height="40" rx="2"
+          fill="#252A2E" stroke="#0B0E0F" stroke-width="1.5"/>
+
+    <!-- Constructivist Cyrillic Wordmark: С И Н Т Е З -->
+    <text x="0" y="9"
+          font-family="'Impact', 'Arial Black', 'Trebuchet MS', sans-serif"
+          font-weight="900"
+          font-size="31"
+          letter-spacing="9"
+          text-anchor="middle"
+          fill="#F5DEB3"
+          stroke="#5B3E08"
+          stroke-width="1"
+          style="text-shadow: 2px 2px 0px #000;">СИНТЕЗ</text>
+  </g>
+
+  <!-- Lower Machine Subtext / Institutional Cold War Stamping -->
+  <text x="256" y="426"
+        font-family="'Courier New', monospace"
+        font-weight="bold"
+        font-size="11.5"
+        letter-spacing="3.5"
+        text-anchor="middle"
+        fill="#D8C3A5"
+        opacity="0.9">НИИ МОЛЕКУЛЯРНОЙ КИБЕРНЕТИКИ</text>
+
+  <text x="256" y="444"
+        font-family="'Courier New', monospace"
+        font-weight="bold"
+        font-size="9"
+        letter-spacing="2"
+        text-anchor="middle"
+        fill="#8E8D8A"
+        opacity="0.8">ЭВМ • МОДЕЛЬ-1984 • ГОССТАНДАРТ</text>
+
+  <!-- Top Imperial / Soviet Little Geometric Star -->
+  <g transform="translate(256, 92)">
+    <polygon points="0,-12 3.5,-3.5 12,0 3.5,3.5 0,12 -3.5,3.5 -12,0 -3.5,-3.5"
+             fill="#FFD54F" stroke="#B78103" stroke-width="1.5"/>
+    <circle r="2.5" fill="#D32F2F"/>
+  </g>
+</svg>

@@ -1,11 +1,20 @@
-# СИНТЕЗ (SINTEZ)
+<p align="center">
+  <img src="docs/sintez_icon.png" width="280" alt="СИНТЕЗ (SINTEZ) Badge" />
+</p>
 
-**Structural Inference by Neural Translation and Energy Zero-shot**
+<h1 align="center">СИНТЕЗ (SINTEZ)</h1>
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Python 3.9+](https://img.shields.io/badge/python-3.9+-green.svg)](https://www.python.org/downloads/)
-[![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-ee4c2c.svg)](https://pytorch.org/)
-[![ESM-2](https://img.shields.io/badge/ESM--2-fair--esm-6f42c1.svg)](https://github.com/facebookresearch/esm)
+<p align="center">
+  <strong>Structural Inference by Neural Translation and Energy Zero-shot</strong><br>
+  <em>Научно-Исследовательский Институт Молекулярной Кибернетики</em>
+</p>
+
+<p align="center">
+  <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT" /></a>
+  <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.9+-green.svg" alt="Python 3.9+" /></a>
+  <a href="https://pytorch.org/"><img src="https://img.shields.io/badge/PyTorch-2.0+-ee4c2c.svg" alt="PyTorch" /></a>
+  <a href="https://github.com/facebookresearch/esm"><img src="https://img.shields.io/badge/ESM--2-fair--esm-6f42c1.svg" alt="ESM-2" /></a>
+</p>
 
 ---
 
