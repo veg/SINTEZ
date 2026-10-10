@@ -39,17 +39,60 @@ Where:
 4. $`\mathcal{P}_{\text{polymer}}`$: A **Jacobson-Stockmayer physical polymer loop closure prior** penalizing entropy loss in long intron excision.
 5. $`\mathcal{P}_{\text{entropy}}`$: An **information-theoretic Shannon sequence entropy normalizer** neutralizing low-complexity periodic repeat blindspots.
 
-```mermaid
-flowchart TD
-    DNA["Genomic DNA Sequence<br/>(Arbitrary AT/GC Bias)"] --> CNB["Composition-Normalized Backbone<br/>(Local Background Subtraction + Dilated CNN + BiGRU)"]
-    CNB --> PROBS["Genomic Probability Tensors<br/>(P_start, P_stop, P_donor, P_acceptor, P_coding)"]
-    PROBS --> DAG["Topological Splicing DAG Decoder<br/>(Jacobson-Stockmayer Polymer Prior)"]
-    DAG --> PARETO["Pareto-Frontier Retention<br/>(Multi-Objective Topology Preservation)"]
-    PARETO --> TRANS["Spliced Virtual Translation Operator<br/>(Phase-Aware Split Codon Splicing)"]
-    TRANS --> AA["Virtual Mature Protein Candidate<br/>(Amino Acid String)"]
-    AA --> ESM["Protein Energy Oracle<br/>(Meta ESM-2 + Shannon Complexity Normalizer)"]
-    ESM --> SCORE["Dual-Space Scoring & Conflict Arbitration<br/>(Strand & Reciprocal Overlap Resolution)"]
-    SCORE --> GFF["Standard GFF3 / NCBI CDS Output"]
+```text
+  ┌─────────────────────────────────────────────────────────────────┐
+  │                   GENOMIC DNA SEQUENCE INPUT                    │
+  │              (Arbitrary GC/AT Skew, e.g. 80.2% AT)              │
+  └────────────────────────────────┬────────────────────────────────┘
+                                   │
+                                   ▼
+  ┌─────────────────────────────────────────────────────────────────┐
+  │          STAGE 1: COMPOSITION-NORMALIZED DNA BACKBONE           │
+  │   - Local Nucleotide Background Subtraction (501 bp window)     │
+  │   - Multi-Scale Dilated Residual Convolutions (d = 1, 3, 9, 27) │
+  │   - Bidirectional GRU Long-Range Sequence Context               │
+  └────────────────────────────────┬────────────────────────────────┘
+                                   │
+                                   ▼
+                       [ GENOMIC PROBABILITY TENSORS ]
+            P(start)    P(stop)    P(donor)    P(acceptor)    P(coding)
+                                   │
+                                   ▼
+  ┌─────────────────────────────────────────────────────────────────┐
+  │            STAGE 2: TOPOLOGICAL SPLICING DAG DECODER            │
+  │   - Dynamic Programming Beam Search over Canonical Splicing     │
+  │   - Jacobson-Stockmayer Intron Polymer Looping Prior            │
+  │   - Pareto-Frontier Multi-Objective Topology Preservation       │
+  └────────────────────────────────┬────────────────────────────────┘
+                                   │ Candidate Splice Graphs
+                                   ▼
+  ┌─────────────────────────────────────────────────────────────────┐
+  │         STAGE 3: SPLICED VIRTUAL TRANSLATION OPERATOR           │
+  │   - Phase-Aware Split-Codon Exon Stitching (Phases 0, 1, 2)     │
+  │   - Canonical Genetic Code Translation [5' -> 3']               │
+  │   - In-Frame Stop Filter & Counterfactual Verification          │
+  └────────────────────────────────┬────────────────────────────────┘
+                                   │ Virtual Mature Protein Candidates
+                                   ▼
+  ┌─────────────────────────────────────────────────────────────────┐
+  │            STAGE 4: PROTEIN FOUNDATION ENERGY ORACLE            │
+  │   - Frozen Meta ESM-2 (esm2_t6_8M_UR50D) Foldability Landscape  │
+  │   - Shannon Sequence Entropy Complexity Normalizer              │
+  │   - Low-Complexity Repeat & Premature Stop Energy Penalty       │
+  └────────────────────────────────┬────────────────────────────────┘
+                                   │ Joint Dual-Space Energy S_joint
+                                   ▼
+  ┌─────────────────────────────────────────────────────────────────┐
+  │           STAGE 5: DUAL-STRAND CONFLICT RESOLUTION              │
+  │   - Cross-Strand Reciprocal Overlap Collision Arbitration       │
+  │   - Global Optimum Selection across Forward (+) & Reverse (-)   │
+  └────────────────────────────────┬────────────────────────────────┘
+                                   │
+                                   ▼
+  ┌─────────────────────────────────────────────────────────────────┐
+  │                 FINAL PREDICTED GENE MODELS                     │
+  │            Standard GFF3 / NCBI RefSeq CDS Format               │
+  └─────────────────────────────────────────────────────────────────┘
 ```
 
 ---
