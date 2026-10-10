@@ -36,8 +36,13 @@ class DualStrandResolver:
                     k_e = kept["spans"][-1][1]
                     k_len = sum(e - s for s, e in kept["spans"])
 
-                    overlap = max(0, min(c_e, k_e) - max(c_s, k_s))
-                    if overlap > max_reciprocal_overlap * min(c_len, k_len):
+                    # Direct coding exon collision across opposing strands
+                    coding_overlap = sum(
+                        max(0, min(e1, e2) - max(s1, s2))
+                        for s1, e1 in cand["spans"]
+                        for s2, e2 in kept["spans"]
+                    )
+                    if coding_overlap > max_reciprocal_overlap * min(c_len, k_len):
                         # Direct antisense coding collision: suppress the lower-scoring candidate
                         clash = True
                         break
