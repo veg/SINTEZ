@@ -21,6 +21,7 @@ from .protein_oracle import ProteinEnergyOracle
 from .translation_operator import SplicedTranslationOperator
 from .dag_decoder import TopologicalDAGDecoder
 from .dual_strand import DualStrandResolver
+from .te_classifier import TransposonClassifier
 
 
 def run_windowed_inference(
@@ -76,7 +77,7 @@ def run_windowed_inference(
 
 
 def write_gff3(predictions: List[Dict], chrom_id: str, out_path: Path):
-    """Writes predicted gene models into standard GFF3 format."""
+    """Writes predicted gene models into standard GFF3 format with stratified biotype attributes."""
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as f:
         f.write("##gff-version 3\n")
@@ -92,7 +93,15 @@ def write_gff3(predictions: List[Dict], chrom_id: str, out_path: Path):
             g_end = spans[-1][1]
             score = pred.get("score", 0.0)
 
-            f.write(f"{chrom_id}\tSINTEZ\tgene\t{g_start}\t{g_end}\t{score:.2f}\t{strand}\t.\tID={gene_id};Name={gene_id}\n")
+            biotype = pred.get("biotype", "protein_coding")
+            gene_type = pred.get("gene_type", "host")
+            te_family = pred.get("te_family", "none")
+            
+            attrs = f"ID={gene_id};Name={gene_id};biotype={biotype};gene_type={gene_type}"
+            if biotype == "transposon_derived" and te_family != "none":
+                attrs += f";te_family={te_family}"
+
+            f.write(f"{chrom_id}\tSINTEZ\tgene\t{g_start}\t{g_end}\t{score:.2f}\t{strand}\t.\t{attrs}\n")
             f.write(f"{chrom_id}\tSINTEZ\tmRNA\t{g_start}\t{g_end}\t{score:.2f}\t{strand}\t.\tID={tx_id};Parent={gene_id}\n")
 
             for e_idx, (e_s, e_e) in enumerate(spans, start=1):
@@ -155,6 +164,22 @@ def cmd_predict(args):
     all_preds = DualStrandResolver.resolve_conflicts(raw_all, max_reciprocal_overlap=0.35)
     print(f"[+] Final Discovered Gene Models: {len(all_preds)} in {time.time()-t0:.1f}s")
 
+    if args.stratify_te:
+        print("[*] Running Built-in Transposon & Mobile Element Classifier...")
+        te_classifier = TransposonClassifier(genome_seq=chrom_seq)
+        host_preds, te_preds = te_classifier.stratify_predictions(all_preds, chrom_seq)
+        print(f"    - Host Cellular Genes: {len(host_preds)} ({len(host_preds)/len(all_preds)*100:.1f}%)")
+        print(f"    - Transposon-Derived: {len(te_preds)} ({len(te_preds)/len(all_preds)*100:.1f}%)")
+
+        if args.transposon_out:
+            te_out = Path(args.transposon_out)
+            write_gff3(te_preds, chrom_id=args.chrom_id, out_path=te_out)
+            print(f"[+] Transposon models written to: {te_out.resolve()}")
+
+        if args.exclude_transposons:
+            all_preds = host_preds
+            print(f"[+] Outputting only host cellular genes ({len(all_preds)} models)")
+
     out_gff = Path(args.out)
     write_gff3(all_preds, chrom_id=args.chrom_id, out_path=out_gff)
     print(f"[+] Output written to: {out_gff.resolve()}")
@@ -174,6 +199,10 @@ def main():
     p_pred.add_argument("--lambda_intron", type=float, default=4.5, help="Splicing log-odds penalty (default: 4.5)")
     p_pred.add_argument("--max_exons", type=int, default=8, help="Maximum exon depth in DAG (default: 8)")
     p_pred.add_argument("--energy_cutoff", type=float, default=13.0, help="ESM-2 free energy cutoff (default: 13.0)")
+    p_pred.add_argument("--stratify_te", action="store_true", default=True, help="Stratify output into host vs transposon-derived genes (default: True)")
+    p_pred.add_argument("--no_stratify_te", action="store_false", dest="stratify_te", help="Disable TE classification")
+    p_pred.add_argument("--exclude_transposons", action="store_true", default=False, help="Exclude transposon-derived genes from primary GFF3 output")
+    p_pred.add_argument("--transposon_out", default=None, help="Optional separate output GFF3 file for transposon-derived genes")
     p_pred.set_defaults(func=cmd_predict)
 
     args = parser.parse_args()
