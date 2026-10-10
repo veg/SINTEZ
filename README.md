@@ -20,21 +20,24 @@
 
 ## 1. Overview & Theoretical Philosophy
 
-Classical eukaryotic gene finders (AUGUSTUS, SNAP, GeneMark-ET, Tiberius) operate strictly within **one-dimensional nucleotide sequence space** $P(\text{Annotations} \mid \text{DNA})$. Because Hidden Markov Models and nucleotide convolutional encoders parameterize transitions directly on nucleotide distributions, their inductive bias collapses when exposed zero-shot to extreme genomic regimes:
+Classical eukaryotic gene finders (AUGUSTUS, SNAP, GeneMark-ET, Tiberius) operate strictly within **one-dimensional nucleotide sequence space** $`P(\text{Annotations} \mid \text{DNA})`$. Because Hidden Markov Models and nucleotide convolutional encoders parameterize transitions directly on nucleotide distributions, their inductive bias collapses when exposed zero-shot to extreme genomic regimes:
 
 - **Compositional Collapse:** When transferred to extreme base skews (e.g., *Plasmodium falciparum* with **80.2% AT content**), classical models suffer catastrophic false positive explosions.
 - **The Splicing Trap:** DNA-space splice site sensors easily mistake periodic AT-rich non-coding repeats for canonical `GT...AG` junctions.
 - **The Ground Truth of Evolution:** The fundamental selective pressure shaping coding genes does **not** act on nucleotide transition probabilities; it acts on the **three-dimensional foldability, thermodynamic stability, and functional fitness of the translated protein product**.
 
 **СИНТЕЗ (SINTEZ)** dissolves this bottleneck through a **Dual-Space Formulation**:
-$$\mathcal{S}_{\text{joint}}(G) = \mathcal{S}_{\text{DNA}}(G) - \alpha \cdot \mathcal{E}_{\text{protein}}(\mathcal{T}(G, \mathbf{x})) - \beta \cdot \mathcal{P}_{\text{polymer}}(\mathcal{G}_{\text{intron}}) - \gamma \cdot \mathcal{P}_{\text{entropy}}(\mathcal{T}(G, \mathbf{x}))$$
+
+```math
+\mathcal{S}_{\text{joint}}(G) = \mathcal{S}_{\text{DNA}}(G) - \alpha \cdot \mathcal{E}_{\text{protein}}(\mathcal{T}(G, \mathbf{x})) - \beta \cdot \mathcal{P}_{\text{polymer}}(\mathcal{G}_{\text{intron}}) - \gamma \cdot \mathcal{P}_{\text{entropy}}(\mathcal{T}(G, \mathbf{x}))
+```
 
 Where:
-1. $\mathcal{S}_{\text{DNA}}$: A **composition-normalized** neural backbone operating on DNA space.
-2. $\mathcal{T}$: A discrete, non-differentiable **spliced virtual translation operator** tracking split codons across intron phase boundaries ($0, 1, 2$).
-3. $\mathcal{E}_{\text{protein}}$: A frozen **biophysical foundation energy oracle** (Meta ESM-2 protein language model) that maps amino acid sequences to pseudo-free-energy foldability landscapes.
-4. $\mathcal{P}_{\text{polymer}}$: A **Jacobson-Stockmayer physical polymer loop closure prior** penalizing entropy loss in long intron excision.
-5. $\mathcal{P}_{\text{entropy}}$: An **information-theoretic Shannon sequence entropy normalizer** neutralizing low-complexity periodic repeat blindspots.
+1. $`\mathcal{S}_{\text{DNA}}`$: A **composition-normalized** neural backbone operating on DNA space.
+2. $`\mathcal{T}`$: A discrete, non-differentiable **spliced virtual translation operator** tracking split codons across intron phase boundaries (0, 1, 2).
+3. $`\mathcal{E}_{\text{protein}}`$: A frozen **biophysical foundation energy oracle** (Meta ESM-2 protein language model) that maps amino acid sequences to pseudo-free-energy foldability landscapes.
+4. $`\mathcal{P}_{\text{polymer}}`$: A **Jacobson-Stockmayer physical polymer loop closure prior** penalizing entropy loss in long intron excision.
+5. $`\mathcal{P}_{\text{entropy}}`$: An **information-theoretic Shannon sequence entropy normalizer** neutralizing low-complexity periodic repeat blindspots.
 
 ```mermaid
 flowchart TD
@@ -75,24 +78,35 @@ The neural DNA backbone (238,407 parameters) was trained **exclusively** on a co
 ### A. Composition-Normalized Neural Backbone (`sintez.dna_backbone`)
 To prevent the model from overfitting to clade-specific GC/AT content:
 - **Local Composition Normalization:** Subtracts running nucleotide frequencies over a 501 bp sliding window:
-  $$x_{\text{norm}} = x - \text{AvgPool1D}(x, W=501)$$
-- **Residual Dilated Convolutions:** Multi-scale receptive fields with exponential dilations ($d \in \{1, 3, 9, 27\}$).
+
+```math
+x_{\text{norm}} = x - \operatorname{AvgPool1D}(x, W=501)
+```
+
+- **Residual Dilated Convolutions:** Multi-scale receptive fields with exponential dilations ($`d \in \{1, 3, 9, 27\}`$).
 - **Bidirectional GRU Context:** Captures long-range exon/intron dependencies across thousands of base pairs.
 
 ### B. Topological Splicing DAG Decoder (`sintez.dag_decoder`)
 Decodes gene structures across directed acyclic graphs with two physics-inspired constraints:
-1. **Jacobson-Stockmayer Intron Polymer Looping Prior:**
-   $$\Delta E_{\text{loop}} = 1.5 \max\left(0, \ln\left(\frac{L_{\text{intron}}}{80}\right)\right)$$
-   Penalizes biologically unfeasible long-range jumps that assemble chimeric mega-transcripts.
-2. **Pareto-Frontier Topology Preservation:**
-   Maintains the top-scoring candidate per exon count $k \in \{1, \dots, 8\}$. DNA-space non-maximum suppression (NMS) only operates within identical topologies, ensuring multi-exon alternatives are evaluated by the protein oracle before suppression.
+
+1. **Jacobson-Stockmayer Intron Polymer Looping Prior:** Penalizes biologically unfeasible long-range jumps that assemble chimeric mega-transcripts:
+
+```math
+\Delta E_{\text{loop}} = 1.5 \max\left(0, \ln\left(\frac{L_{\text{intron}}}{80}\right)\right)
+```
+
+2. **Pareto-Frontier Topology Preservation:** Maintains the top-scoring candidate per exon count $`k \in \{1, \dots, 8\}`$. DNA-space non-maximum suppression (NMS) only operates within identical topologies, ensuring multi-exon alternatives are evaluated by the protein oracle before suppression.
 
 ### C. Protein Foundation Energy Oracle (`sintez.protein_oracle`)
 Computes an evolutionary free-energy score for virtual translation products:
 - **Evolutionary Likelihood:** Per-residue cross-entropy under frozen Meta ESM-2 (`esm2_t6_8M_UR50D`).
-- **Information-Theoretic Complexity Normalization:**
-  $$\mathcal{H}_{\text{Shannon}} = -\sum_{i=1}^{20} p(a_i) \log_2 p(a_i)$$
-  Applies an energetic penalty for sequences with $\mathcal{H}_{\text{Shannon}} < 3.2$ bits, eliminating false positive detections on repetitive non-coding elements (e.g., Telomere-Associated Repetitive Elements / TAREs).
+- **Information-Theoretic Complexity Normalization:** Calculates the Shannon information entropy of the amino acid sequence:
+
+```math
+\mathcal{H}_{\text{Shannon}} = -\sum_{i=1}^{20} p(a_i) \log_2 p(a_i)
+```
+
+  Applies an energetic penalty for sequences with $`\mathcal{H}_{\text{Shannon}} \lt 3.2`$ bits, eliminating false positive detections on repetitive non-coding elements (e.g., Telomere-Associated Repetitive Elements / TAREs).
 
 ### D. Dual-Strand Reciprocal Conflict Resolver (`sintez.dual_strand`)
 Resolves forward and reverse strand collisions by evaluating joint dual-space scores, suppressing antisense artifacts while preserving authentic antiparallel overlapping genes.

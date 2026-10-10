@@ -7,14 +7,22 @@ This document outlines the theoretical developments and engineering milestones p
 ## 1. Differentiable Translation Operator & End-to-End Gradients (SINTEZ v1.5)
 
 ### Problem
-In the current v1.0 architecture, the translation operator $\mathcal{T}$ is a discrete, non-differentiable mapping evaluated in Stage 2. Consequently, the DNA backbone can only be trained contrastively via counterfactual hard sampling, rather than through direct end-to-end gradient backpropagation from ESM-2.
+In the current v1.0 architecture, the translation operator $`\mathcal{T}`$ is a discrete, non-differentiable mapping evaluated in Stage 2. Consequently, the DNA backbone can only be trained contrastively via counterfactual hard sampling, rather than through direct end-to-end gradient backpropagation from ESM-2.
 
 ### Proposed Architecture
 - Formulate a **differentiable relaxation** of the genetic code lookup:
-  $$\mathbf{e}_{\text{codon}} = \mathbf{x}_{i} \otimes \mathbf{x}_{i+1} \otimes \mathbf{x}_{i+2} \in \mathbb{R}^{64}$$
-- Map the 64-dimensional codon simplex to amino acid continuous embeddings via a learned projection matrix $\mathbf{W}_{\text{code}} \in \mathbb{R}^{20 \times 64}$:
-  $$\mathbf{z}_{\text{AA}} = \mathbf{W}_{\text{code}} \cdot \mathbf{e}_{\text{codon}}$$
-- Route $\mathbf{z}_{\text{AA}}$ directly into the initial transformer layer of ESM-2, enabling backpropagation of protein folding stability gradients directly into the DNA splice junction convolutional filters.
+
+```math
+\mathbf{e}_{\text{codon}} = \mathbf{x}_{i} \otimes \mathbf{x}_{i+1} \otimes \mathbf{x}_{i+2} \in \mathbb{R}^{64}
+```
+
+- Map the 64-dimensional codon simplex to amino acid continuous embeddings via a learned projection matrix $`\mathbf{W}_{\text{code}} \in \mathbb{R}^{20 \times 64}`$:
+
+```math
+\mathbf{z}_{\text{AA}} = \mathbf{W}_{\text{code}} \cdot \mathbf{e}_{\text{codon}}
+```
+
+- Route $`\mathbf{z}_{\text{AA}}`$ directly into the initial transformer layer of ESM-2, enabling backpropagation of protein folding stability gradients directly into the DNA splice junction convolutional filters.
 
 ---
 
@@ -25,8 +33,12 @@ Spurious chimeric gene models occasionally concatenate two authentic adjacent ge
 
 ### Proposed Solution
 - Authentic multi-exon proteins fold into cohesive tertiary domains, exhibiting **dense residue-residue contacts across exon junctions**:
-  $$\mathcal{C}_{\text{junction}} = \frac{1}{|E_1| |E_2|} \sum_{i \in E_1} \sum_{j \in E_2} P(\text{contact}(i, j) \mid \text{ESM-2})$$
-- Chimeric concatenations will have a **contact desert** between the independent protein domains. Incorporating $\mathcal{C}_{\text{junction}}$ into the DAG edge scoring function will naturally penalize chimeric fusions without requiring artificial length ceilings.
+
+```math
+\mathcal{C}_{\text{junction}} = \frac{1}{|E_1| \cdot |E_2|} \sum_{i \in E_1} \sum_{j \in E_2} P(\text{contact}(i, j) \mid \text{ESM-2})
+```
+
+- Chimeric concatenations will have a **contact desert** between the independent protein domains. Incorporating $`\mathcal{C}_{\text{junction}}`$ into the DAG edge scoring function will naturally penalize chimeric fusions without requiring artificial length ceilings.
 
 ---
 
@@ -37,8 +49,12 @@ While >98% of eukaryotic introns follow canonical `GT...AG` rules, non-canonical
 
 ### Implementation
 - Dynamically expand the acceptor/donor search dictionary in `sintez.dag_decoder` to include `GC` donors and `AT...AC` pairs when:
-  $$P_{\text{donor}}(d) \times P_{\text{acceptor}}(a) > \tau_{\text{noncanonical}}$$
-- Implement an explicit Bayesian prior penalty $\lambda_{\text{noncanon}} \approx 3.0$ nats to reflect the empirical 1:100 biological frequency ratio.
+
+```math
+P_{\text{donor}}(d) \times P_{\text{acceptor}}(a) \gt \tau_{\text{noncanonical}}
+```
+
+- Implement an explicit Bayesian prior penalty $`\lambda_{\text{noncanon}} \approx 3.0`$ nats to reflect the empirical 1:100 biological frequency ratio.
 
 ---
 
