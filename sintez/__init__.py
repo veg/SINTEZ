@@ -20,6 +20,7 @@ from .protein_oracle import ProteinEnergyOracle
 from .translation_operator import SplicedTranslationOperator, SplicedTranscript
 from .dag_decoder import TopologicalDAGDecoder
 from .dual_strand import DualStrandResolver
+from .te_classifier import TransposonClassifier
 
 __all__ = [
     "CompositionNormalizedBackbone",
@@ -29,4 +30,6 @@ __all__ = [
     "SplicedTranscript",
     "TopologicalDAGDecoder",
     "DualStrandResolver",
+    "TransposonClassifier",
 ]
+
