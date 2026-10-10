@@ -123,7 +123,7 @@ To prevent the model from overfitting to clade-specific GC/AT content:
 - **Local Composition Normalization:** Subtracts running nucleotide frequencies over a 501 bp sliding window:
 
 ```math
-x_{\text{norm}} = x - \operatorname{AvgPool1D}(x, W=501)
+x_{\text{norm}} = x - \text{AvgPool1D}(x, W=501)
 ```
 
 - **Residual Dilated Convolutions:** Multi-scale receptive fields with exponential dilations ($`d \in \{1, 3, 9, 27\}`$).
