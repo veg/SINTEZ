@@ -14,7 +14,7 @@ class DualStrandResolver:
 
     @staticmethod
     def resolve_conflicts(
-        predictions: List[Dict], max_reciprocal_overlap: float = 0.35
+        predictions: List[Dict], max_reciprocal_overlap: float = 0.15
     ) -> List[Dict]:
         """
         Suppresses lower-scoring shadow decoys while preserving genuine convergent,

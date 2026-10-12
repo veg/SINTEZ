@@ -39,9 +39,8 @@ class ProteinEnergyOracle:
         if device is None:
             if torch.cuda.is_available():
                 self.device = torch.device("cuda")
-            elif torch.backends.mps.is_available():
-                self.device = torch.device("mps")
             else:
+                # CPU is 7.2 ms/peptide on Apple Silicon and eliminates MPSGraph dynamic-length JIT compilation leaks
                 self.device = torch.device("cpu")
         else:
             self.device = torch.device(device)
