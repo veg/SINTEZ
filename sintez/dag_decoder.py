@@ -146,21 +146,31 @@ class TopologicalDAGDecoder:
         raw_acceptors = np.where(accept_p >= self.min_accept_prob)[0]
         acceptor_list = [int(a + 1) for a in raw_acceptors if 0 < a < L - 1 and dna_upper[a-1:a+1] == "AG"]
 
-        # 4. Candidate Starts calibrated to distribution of ATG scores
+        # 4. Candidate Starts: Primary threshold + secondary relative peak support for non-canonical contexts
         atg_indices = [i for i in range(L - 2) if dna_upper[i:i+3] == "ATG"]
+        cand_starts_set = set()
         if atg_indices:
             atg_scores = start_p[atg_indices]
             p80 = float(np.percentile(atg_scores, 80.0))
             th_start = max(self.min_start_prob, min(p80, 0.05))
-            cand_starts = [i for i in atg_indices if start_p[i] >= th_start]
-        else:
-            cand_starts = []
+            for i in atg_indices:
+                if start_p[i] >= th_start:
+                    cand_starts_set.add(i)
 
+            # Secondary relative peaks for non-canonical/GC-rich Kozak contexts
+            if len(cand_starts_set) < max(50, L // 3000):
+                for idx, i in enumerate(atg_indices):
+                    if start_p[i] >= 0.0003:
+                        _, dn_cod = get_exon_metrics(i, min(L, i + 120))
+                        if dn_cod >= max(0.40, p0 * 2.0):
+                            cand_starts_set.add(i)
+
+        cand_starts = sorted(list(cand_starts_set))
         all_best_per_start = []
         min_cod_th = max(0.25, p0 * 1.5)
 
         for s in cand_starts:
-            init_signal = math.log(1.0 + 50.0 * float(start_p[s]))
+            init_signal = math.log(1.0 + 50.0 * max(float(start_p[s]), 0.003))
             # Active paths store: (spans, last_end, phase, exon_count, total_len, cum_signal, cum_llr)
             active_paths = [([], s, 0, 1, 0, init_signal, 0.0)]
             completed_for_s = []
@@ -210,7 +220,7 @@ class TopologicalDAGDecoder:
                                 "dna_score": dna_score,
                             })
 
-                    # Option B: Spliced Extension via Full-Horizon Donor Search (Binary Search Indexed)
+                    # Option B: Spliced Extension via Boundary Step-Derivative Donor Search
                     if depth < self.max_exons and (first_stop - last_end) >= self.min_internal_exon_len:
                         d_start = last_end + self.min_internal_exon_len
                         d_i0 = bisect.bisect_left(donor_list, d_start)
@@ -220,7 +230,16 @@ class TopologicalDAGDecoder:
                             d = donor_list[idx]
                             d_p = float(donor_p[d])
                             e_llr, e_mp = get_exon_metrics(last_end, d)
-                            saliency = math.log(1.0 + 100.0 * d_p) + 2.0 * e_mp
+                            
+                            # Boundary Step-Derivative: Exon-exit drop into intron
+                            up_s = max(last_end, d - 30)
+                            _, up_mp = get_exon_metrics(up_s, d)
+                            dn_e = min(L, d + 30)
+                            _, dn_mp = get_exon_metrics(d, dn_e)
+                            coding_drop = max(0.0, up_mp - dn_mp)
+
+                            # Saliency combines point sensor with coding step-down
+                            saliency = math.log(1.0 + 100.0 * d_p) + 3.0 * coding_drop + 2.0 * e_mp
                             if e_mp >= max(0.20, p0 * 1.5):
                                 valid_donors.append((d, d_p, e_llr, e_mp, saliency))
 
@@ -238,14 +257,39 @@ class TopologicalDAGDecoder:
                             valid_a = []
                             for idx in range(a_i0, a_i1):
                                 a = acceptor_list[idx]
-                                valid_a.append((a, float(accept_p[a-1])))
+                                # PPT (polypyrimidine tract) density in [-25, -4] upstream window
+                                ppt_win = dna_upper[max(0, a - 25):max(0, a - 4)]
+                                ppt_ratio = (sum(1 for c in ppt_win if c in {'C', 'T'}) / len(ppt_win)) if len(ppt_win) >= 10 else 0.5
+                                a_saliency = float(accept_p[a-1]) * (0.5 + ppt_ratio)
+                                valid_a.append((a, float(accept_p[a-1]), a_saliency))
 
-                            valid_a.sort(key=lambda x: x[1], reverse=True)
+                            valid_a.sort(key=lambda x: x[2], reverse=True)
 
-                            for a, a_score in valid_a[:4]:
+                            for a, a_score, _ in valid_a[:4]:
+                                # Immediate Split-Codon Phase Pruning: Reject lethal in-frame nonsense stops
+                                if d_phase == 1 and d >= 1 and a + 2 <= L:
+                                    split_codon = dna_upper[d - 1] + dna_upper[a:a + 2]
+                                    if split_codon in {"TAA", "TAG", "TGA"}:
+                                        continue
+                                elif d_phase == 2 and d >= 2 and a + 1 <= L:
+                                    split_codon = dna_upper[d - 2:d] + dna_upper[a]
+                                    if split_codon in {"TAA", "TAG", "TGA"}:
+                                        continue
+
                                 intron_len = a - d
                                 loop_penalty = 1.0 * max(0.0, math.log(max(1.0, intron_len / 80.0)))
-                                intron_gain = math.log(1.0 + 50.0 * d_score) + math.log(1.0 + 50.0 * a_score) - self.lambda_intron - loop_penalty
+                                
+                                # Coding-excision penalty prevents excising high-scoring coding sequence
+                                int_llr, _ = get_exon_metrics(d, a)
+                                coding_excision_penalty = max(0.0, int_llr * 0.5)
+
+                                intron_gain = (
+                                    math.log(1.0 + 50.0 * d_score)
+                                    + math.log(1.0 + 50.0 * a_score)
+                                    - self.lambda_intron
+                                    - loop_penalty
+                                    - coding_excision_penalty
+                                )
 
                                 # Soft-margin bridging for high coding regions
                                 if e_mp >= max(0.30, p0 * 2.0):

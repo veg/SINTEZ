@@ -14,6 +14,7 @@ Features:
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Tuple, Dict, Optional
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -48,15 +49,26 @@ class FocalLoss(nn.Module):
 
     def forward(self, prob: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         p = torch.clamp(prob, self.eps, 1.0 - self.eps)
+        bce = -(target * torch.log(p) + (1.0 - target) * torch.log(1.0 - p))
         pt = p * target + (1.0 - p) * (1.0 - target)
         w = self.alpha * target + (1.0 - self.alpha) * (1.0 - target)
         focal_weight = w * torch.pow(1.0 - pt, self.gamma)
-        loss = -focal_weight * torch.log(pt)
+        loss = focal_weight * bce
         if self.reduction == "mean":
             return loss.mean()
         elif self.reduction == "sum":
             return loss.sum()
         return loss
+
+
+def apply_gaussian_smoothing(tensor: torch.Tensor, center: int, sigma: float = 1.0, radius: int = 2):
+    """Applies a smooth Gaussian window around junction/codon coordinates."""
+    L = tensor.size(0)
+    for offset in range(-radius, radius + 1):
+        pos = center + offset
+        if 0 <= pos < L:
+            weight = math.exp(-0.5 * (offset / sigma) ** 2)
+            tensor[pos] = max(tensor[pos].item(), weight)
 
 
 class CounterfactualDataset(Dataset):
@@ -100,16 +112,14 @@ class CounterfactualDataset(Dataset):
         target_span = torch.zeros(L, dtype=torch.long)          # 0: Intergenic, 1: Intron, 2: Exon
         target_span_7class = torch.zeros(L, dtype=torch.long)   # 0: Inter, 1: Intron, 2-4: Phase 0/1/2, 5: Start, 6: Stop
 
-        # Mark introns
+        # Mark introns and splice junctions with Gaussian soft-window targets
         for i in range(len(spans) - 1):
             intron_start = spans[i][1]
             intron_end = spans[i+1][0]
             target_span[intron_start:intron_end] = 1
             target_span_7class[intron_start:intron_end] = 1
-            if 0 <= intron_start < L:
-                target_donor[intron_start] = 1.0
-            if 0 <= intron_end - 1 < L:
-                target_acceptor[intron_end - 1] = 1.0
+            apply_gaussian_smoothing(target_donor, intron_start, sigma=1.0, radius=2)
+            apply_gaussian_smoothing(target_acceptor, intron_end - 1, sigma=1.0, radius=2)
 
         # Mark exons and phases
         cum_cds = 0
@@ -120,14 +130,12 @@ class CounterfactualDataset(Dataset):
                 target_span_7class[pos] = 2 + phase
                 cum_cds += 1
 
-        # Mark start and stop codons
+        # Mark start and stop codons with Gaussian soft-window targets
         if spans:
             s_first = spans[0][0]
             e_last = spans[-1][1]
-            if 0 <= s_first < L:
-                target_start[s_first] = 1.0
-            if 0 <= e_last - 3 < L:
-                target_stop[e_last - 3] = 1.0
+            apply_gaussian_smoothing(target_start, s_first, sigma=1.0, radius=2)
+            apply_gaussian_smoothing(target_stop, e_last - 3, sigma=1.0, radius=2)
 
             # 7-class start/stop regions
             if 0 <= s_first and s_first + 3 <= L:
