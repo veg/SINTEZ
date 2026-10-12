@@ -287,10 +287,18 @@ class ContrastiveEnergyTrainer:
 
         return log_prob
 
-    def train_step(self, batch: Dict, compute_energy: bool = False) -> Dict[str, float]:
+    def train_step(
+        self,
+        batch: Dict,
+        compute_energy: bool = False,
+        accum_steps: int = 1,
+        step_optimizer: bool = True,
+        zero_grad: bool = True,
+    ) -> Dict[str, float]:
         """Executes a single contrastive optimization step on one sample."""
         self.backbone.train()
-        self.optimizer.zero_grad()
+        if zero_grad:
+            self.optimizer.zero_grad()
 
         one_hot = batch["one_hot_dna"].unsqueeze(0)
         device = next(self.backbone.parameters()).device
@@ -369,9 +377,14 @@ class ContrastiveEnergyTrainer:
             + self.lambda_contrastive * contrastive_loss
         )
 
-        total_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.backbone.parameters(), max_norm=1.0)
-        self.optimizer.step()
+        loss_to_backprop = total_loss / max(1, accum_steps)
+        loss_to_backprop.backward()
+
+        if step_optimizer:
+            torch.nn.utils.clip_grad_norm_(self.backbone.parameters(), max_norm=1.0)
+            self.optimizer.step()
+            if not zero_grad:
+                self.optimizer.zero_grad()
 
         if device.type == "mps":
             torch.mps.empty_cache()
