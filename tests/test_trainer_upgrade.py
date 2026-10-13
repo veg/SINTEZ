@@ -163,3 +163,33 @@ def test_differentiable_contrastive_trainer_gradients():
     # Verify gradients flow into backbone parameters!
     has_grad = any(p.grad is not None and torch.any(p.grad != 0.0) for p in backbone.parameters())
     assert has_grad, "Expected non-zero gradients from path ranking loss into backbone!"
+
+
+def test_length_bucketing_and_gradient_flow():
+    cfg = DNAEncoderConfig.classic_v1(hidden_dim=32, norm_window_size=21)
+    backbone = CompositionNormalizedBackbone(cfg)
+    trainer = ContrastiveEnergyTrainer(
+        backbone=backbone,
+        oracle=None,
+        learning_rate=1e-3,
+        loss_type="focal",
+    )
+
+    # 37 bp sequence with bucket_step=64 -> should pad to 64 bp
+    seq = "ATGGCCAAGTTT" + "GTACGTACGTACG" + "AAAGCCGATTGA"
+    assert len(seq) == 37
+    sample = GenomicGeneSample(dna_sequence=seq, exon_spans=[(0, 12), (25, 37)], strand="+")
+    dataset = CounterfactualDataset([sample], bucket_step=64)
+    item = dataset[0]
+
+    assert item["valid_len"] == 37
+    assert item["one_hot_dna"].shape == (4, 64)
+    assert item["target_donor"].shape == (37,)
+
+    # Train step with bucketing
+    metrics = trainer.train_step(item, compute_energy=False)
+    assert metrics["total_loss"] > 0.0
+
+    # Ensure gradients flowed to backbone parameters
+    has_grad = any(p.grad is not None and torch.any(p.grad != 0.0) for p in backbone.parameters())
+    assert has_grad, "Expected gradients to flow to backbone through bucket-padded inputs!"

@@ -76,10 +76,16 @@ class CounterfactualDataset(Dataset):
     Dataset that pairs genomic sequences with true exon structures and
     synthesizes on-the-fly hard counterfactual frame perturbations.
     """
-    def __init__(self, samples: List[GenomicGeneSample], generate_negatives: bool = False):
+    def __init__(
+        self,
+        samples: List[GenomicGeneSample],
+        generate_negatives: bool = False,
+        bucket_step: Optional[int] = None,
+    ):
         self.samples = samples
         self.operator = SplicedTranslationOperator()
         self.generate_negatives = generate_negatives
+        self.bucket_step = bucket_step
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -145,6 +151,15 @@ class CounterfactualDataset(Dataset):
 
         one_hot_dna = CompositionNormalizedBackbone.sequence_to_one_hot(dna_str).squeeze(0)
 
+        valid_len = L
+        if self.bucket_step is not None and self.bucket_step > 0:
+            rem = L % self.bucket_step
+            pad_len = (self.bucket_step - rem) if rem != 0 else 0
+            if pad_len > 0:
+                one_hot_padded = torch.full((4, L + pad_len), 0.25, dtype=torch.float32)
+                one_hot_padded[:, :L] = one_hot_dna
+                one_hot_dna = one_hot_padded
+
         return {
             "dna_str": dna_str,
             "one_hot_dna": one_hot_dna,
@@ -156,6 +171,7 @@ class CounterfactualDataset(Dataset):
             "target_span_7class": target_span_7class,
             "true_transcript": true_transcript,
             "negatives": negatives,
+            "valid_len": valid_len,
         }
 
 
@@ -317,6 +333,14 @@ class ContrastiveEnergyTrainer:
         # 1. Forward Pass
         preds = self.backbone(one_hot)
         L = one_hot.shape[-1]
+        valid_len = batch.get("valid_len", L)
+
+        if valid_len < L:
+            preds = {
+                k: v[..., :valid_len] if isinstance(v, torch.Tensor) and v.ndim >= 2 and v.shape[-1] == L else v
+                for k, v in preds.items()
+            }
+            L = valid_len
 
         # 2. Junction Boundary Losses (Focal or BCE)
         loss_donor = self.junc_loss_fn(preds["donor_prob"].squeeze(), t_donor)
