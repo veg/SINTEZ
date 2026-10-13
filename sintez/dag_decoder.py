@@ -110,9 +110,9 @@ class TopologicalDAGDecoder:
         coding_p = preds["coding"]
 
         # 1. Prefix-sum arrays for O(1) log-odds and coding probability integration
-        # Empirical background calibration: adapts neutral point dynamically
-        p0_est = float(np.percentile(coding_p, 25.0)) if L > 1000 else 0.10
-        p0 = max(0.08, min(p0_est, 0.20))
+        # Empirical background calibration: adapts neutral point dynamically to GC regime
+        p0_est = float(np.percentile(coding_p, 30.0)) if L > 1000 else 0.15
+        p0 = max(0.08, min(p0_est, 0.38))
         llr_offset = math.log(p0 / (1.0 - p0))
 
         eps = 1e-4
@@ -167,7 +167,7 @@ class TopologicalDAGDecoder:
 
         cand_starts = sorted(list(cand_starts_set))
         all_best_per_start = []
-        min_cod_th = max(0.25, p0 * 1.5)
+        min_cod_th = max(0.30, p0 * 1.35)
 
         for s in cand_starts:
             init_signal = math.log(1.0 + 50.0 * max(float(start_p[s]), 0.003))
@@ -193,7 +193,9 @@ class TopologicalDAGDecoder:
                     t_len = total_len + ex_len
 
                     # Option A: In-frame Stop Codon Termination
-                    if t_len >= (self.min_single_len if depth == 1 else self.min_multi_len):
+                    is_single_exon = (depth == 1)
+                    min_len_req = self.min_single_len if is_single_exon else self.min_multi_len
+                    if t_len >= min_len_req:
                         cand_spans = spans + [(last_end, e)]
                         tot_llr = 0.0
                         tot_p_sum = 0.0
@@ -203,6 +205,10 @@ class TopologicalDAGDecoder:
                             tot_p_sum += s_mp * (ee - es)
                         mean_cod = tot_p_sum / max(1, t_len)
 
+                        # Single-exon genes lack splicing signals, requiring stricter coding purity
+                        min_cod_req = max(0.48, p0 * 1.7) if is_single_exon else min_cod_th
+                        min_llr_req = 1.0 if is_single_exon else 0.0
+
                         stop_score = math.log(1.0 + 50.0 * float(stop_p[first_stop]))
                         len_evidence = 2.0 * math.log(t_len) - max(0.0, (240 - t_len) / 20.0)
 
@@ -211,7 +217,7 @@ class TopologicalDAGDecoder:
                         dna_score = total_signal + norm_llr * 0.5 + mean_cod * 6.0 + len_evidence
 
                         # Filter candidates with net positive coding evidence and sufficient coding density
-                        if tot_llr > 0.0 and mean_cod >= min_cod_th:
+                        if tot_llr > min_llr_req and mean_cod >= min_cod_req:
                             completed_for_s.append({
                                 "spans": cand_spans,
                                 "len": t_len,
