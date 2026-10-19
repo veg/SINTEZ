@@ -34,12 +34,14 @@ def run_windowed_inference(
     """Runs sliding-window inference across long genomic scaffolds."""
     backbone.eval()
     L = len(seq)
+    pad = (window_size - stride) // 2
     preds = {
         "start": np.zeros(L, dtype=np.float32),
         "stop": np.zeros(L, dtype=np.float32),
         "donor": np.zeros(L, dtype=np.float32),
         "acceptor": np.zeros(L, dtype=np.float32),
         "coding": np.zeros(L, dtype=np.float32),
+        "phase": np.zeros((3, L), dtype=np.float32),
     }
     counts = np.zeros(L, dtype=np.float32)
 
@@ -52,6 +54,7 @@ def run_windowed_inference(
 
     for w_idx, (w_start, w_end) in enumerate(windows, start=1):
         w_seq = seq[w_start:w_end]
+        w_len = len(w_seq)
         one_hot = CompositionNormalizedBackbone.sequence_to_one_hot(w_seq).to(device)
         with torch.no_grad():
             out = backbone(one_hot)
@@ -62,16 +65,36 @@ def run_windowed_inference(
         p_donor = out["donor_prob"].squeeze().cpu().numpy()
         p_accept = out["acceptor_prob"].squeeze().cpu().numpy()
 
-        preds["start"][w_start:w_end] += p_start
-        preds["stop"][w_start:w_end] += p_stop
-        preds["donor"][w_start:w_end] += p_donor
-        preds["acceptor"][w_start:w_end] += p_accept
-        preds["coding"][w_start:w_end] += span_coding
-        counts[w_start:w_end] += 1.0
+        raw_sp = out.get("span_probs_raw", out["span_probs"])
+        if raw_sp.shape[1] >= 7:
+            p_3 = (
+                raw_sp[:, 2:5, :]
+                + (raw_sp[:, 5:6, :] + raw_sp[:, 6:7, :]) / 3.0
+            ).squeeze(0).cpu().numpy()
+        else:
+            p_3 = np.repeat(span_coding[np.newaxis, :] / 3.0, 3, axis=0)
 
-    counts = np.maximum(counts, 1.0)
-    for k in preds:
+        weight = np.ones(w_len, dtype=np.float32)
+        edge = min(pad, w_len // 4)
+        if edge > 0:
+            ramp = np.linspace(0.1, 1.0, edge, dtype=np.float32)
+            if w_start > 0:
+                weight[:edge] *= ramp
+            if w_end < L:
+                weight[-edge:] *= ramp[::-1]
+
+        preds["start"][w_start:w_end] += p_start * weight
+        preds["stop"][w_start:w_end] += p_stop * weight
+        preds["donor"][w_start:w_end] += p_donor * weight
+        preds["acceptor"][w_start:w_end] += p_accept * weight
+        preds["coding"][w_start:w_end] += span_coding * weight
+        preds["phase"][:, w_start:w_end] += p_3 * weight[np.newaxis, :]
+        counts[w_start:w_end] += weight
+
+    counts = np.maximum(counts, 1e-6)
+    for k in ("start", "stop", "donor", "acceptor", "coding"):
         preds[k] /= counts
+    preds["phase"] /= counts[np.newaxis, :]
 
     return preds
 
@@ -123,9 +146,16 @@ def cmd_predict(args):
         raise FileNotFoundError(f"Checkpoint not found at: {ckpt_path}")
 
     print(f"[+] Loading SINTEZ Backbone from {ckpt_path.resolve()}...")
-    cfg = DNAEncoderConfig(in_channels=4, hidden_dim=64, kernel_size=7, norm_window_size=201, dropout=0.1)
+    state_dict = torch.load(ckpt_path, map_location=device)
+    span_w = state_dict.get("span_head.weight")
+    if span_w is not None and span_w.shape[0] == 7:
+        hidden_dim = span_w.shape[1]
+        use_gru = any(k.startswith("gru.") for k in state_dict.keys())
+        cfg = DNAEncoderConfig.foundation_v2(hidden_dim=hidden_dim, num_span_classes=7, use_gru=use_gru)
+    else:
+        cfg = DNAEncoderConfig(in_channels=4, hidden_dim=64, kernel_size=7, norm_window_size=201, dropout=0.1)
     backbone = CompositionNormalizedBackbone(cfg).to(device)
-    backbone.load_state_dict(torch.load(ckpt_path, map_location=device))
+    backbone.load_state_dict(state_dict)
     backbone.eval()
 
     oracle = ProteinEnergyOracle(device=device)

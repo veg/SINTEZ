@@ -125,12 +125,26 @@ class TopologicalDAGDecoder:
         cumsum_cod = np.zeros(L + 1, dtype=np.float64)
         cumsum_cod[1:] = np.cumsum(coding_p)
 
+        # Optional 3-frame phase-specific prefix sums from 7-class backbone
+        has_phase = "phase" in preds and preds["phase"] is not None
+        cumsum_frame = np.zeros((3, L + 1), dtype=np.float64)
+        if has_phase:
+            phase_p = preds["phase"]  # shape (3, L): codon positions 0, 1, 2
+            idx_arr = np.arange(L)
+            for f_idx in (0, 1, 2):
+                cumsum_frame[f_idx, 1:] = np.cumsum(phase_p[(idx_arr - f_idx) % 3, idx_arr])
+
         def get_exon_metrics(s: int, e: int) -> Tuple[float, float]:
             if e <= s:
                 return 0.0, 0.0
             tot_llr = cumsum_llr[e] - cumsum_llr[s]
             mean_p = (cumsum_cod[e] - cumsum_cod[s]) / (e - s)
             return float(tot_llr), float(mean_p)
+
+        def get_frame_mean(f_idx: int, s: int, e: int) -> float:
+            if not has_phase or e <= s:
+                return 0.0
+            return float(cumsum_frame[f_idx, e] - cumsum_frame[f_idx, s]) / (e - s)
 
         # 2. Pre-index stop codons by reading frame phase for O(log N) lookup
         stops_set = {"TAA", "TAG", "TGA"}
@@ -199,11 +213,19 @@ class TopologicalDAGDecoder:
                         cand_spans = spans + [(last_end, e)]
                         tot_llr = 0.0
                         tot_p_sum = 0.0
+                        tot_frame_p_sum = 0.0
+                        cur_ph = 0
                         for es, ee in cand_spans:
                             s_llr, s_mp = get_exon_metrics(es, ee)
                             tot_llr += s_llr
                             tot_p_sum += s_mp * (ee - es)
+                            if has_phase:
+                                f_ex = (es - cur_ph) % 3
+                                tot_frame_p_sum += get_frame_mean(f_ex, es, ee) * (ee - es)
+                                cur_ph = (cur_ph + (ee - es)) % 3
                         mean_cod = tot_p_sum / max(1, t_len)
+                        mean_frame_cod = (tot_frame_p_sum / max(1, t_len)) if has_phase else mean_cod
+                        frame_purity = (mean_frame_cod / max(1e-4, mean_cod)) if has_phase else 1.0
 
                         # Single-exon genes lack splicing signals, requiring stricter coding purity
                         min_cod_req = max(0.48, p0 * 1.7) if is_single_exon else min_cod_th
@@ -214,10 +236,11 @@ class TopologicalDAGDecoder:
 
                         total_signal = cum_signal + stop_score
                         norm_llr = tot_llr / math.sqrt(max(1, t_len))
-                        dna_score = total_signal + norm_llr * 0.5 + mean_cod * 6.0 + len_evidence
+                        frame_bonus = (2.5 * mean_frame_cod) if has_phase else 0.0
+                        dna_score = total_signal + norm_llr * 0.5 + mean_cod * 6.0 + frame_bonus + len_evidence
 
-                        # Filter candidates with net positive coding evidence and sufficient coding density
-                        if tot_llr > min_llr_req and mean_cod >= min_cod_req:
+                        # Filter candidates with net positive coding evidence, sufficient coding density, and reading-frame coherence
+                        if tot_llr > min_llr_req and mean_cod >= min_cod_req and frame_purity >= 0.25:
                             completed_for_s.append({
                                 "spans": cand_spans,
                                 "len": t_len,
@@ -232,10 +255,12 @@ class TopologicalDAGDecoder:
                         d_i0 = bisect.bisect_left(donor_list, d_start)
                         d_i1 = bisect.bisect_right(donor_list, first_stop)
                         valid_donors = []
+                        f_ex = (last_end - phase) % 3
                         for idx in range(d_i0, d_i1):
                             d = donor_list[idx]
                             d_p = float(donor_p[d])
                             e_llr, e_mp = get_exon_metrics(last_end, d)
+                            e_f_mp = get_frame_mean(f_ex, last_end, d)
                             
                             # Boundary Step-Derivative: Exon-exit drop into intron
                             up_s = max(last_end, d - 30)
@@ -244,9 +269,15 @@ class TopologicalDAGDecoder:
                             _, dn_mp = get_exon_metrics(d, dn_e)
                             coding_drop = max(0.0, up_mp - dn_mp)
 
-                            # Saliency combines point sensor with coding step-down
-                            saliency = math.log(1.0 + 100.0 * d_p) + 3.0 * coding_drop + 2.0 * e_mp
-                            if e_mp >= max(0.20, p0 * 1.5):
+                            # Saliency combines point sensor, coding step-down, and reading-frame coherence
+                            saliency = (
+                                math.log(1.0 + 100.0 * d_p)
+                                + 8.0 * d_p
+                                + 3.0 * coding_drop
+                                + 2.0 * e_mp
+                                + (2.5 * e_f_mp if has_phase else 0.0)
+                            )
+                            if e_mp >= max(0.20, p0 * 1.5) and (not has_phase or (e_f_mp / max(1e-4, e_mp)) >= 0.20):
                                 valid_donors.append((d, d_p, e_llr, e_mp, saliency))
 
                         valid_donors.sort(key=lambda x: x[4], reverse=True)
@@ -263,15 +294,32 @@ class TopologicalDAGDecoder:
                             valid_a = []
                             for idx in range(a_i0, a_i1):
                                 a = acceptor_list[idx]
+                                ap = float(accept_p[a-1])
                                 # PPT (polypyrimidine tract) density in [-25, -4] upstream window
                                 ppt_win = dna_upper[max(0, a - 25):max(0, a - 4)]
                                 ppt_ratio = (sum(1 for c in ppt_win if c in {'C', 'T'}) / len(ppt_win)) if len(ppt_win) >= 10 else 0.5
-                                a_saliency = float(accept_p[a-1]) * (0.5 + ppt_ratio)
-                                valid_a.append((a, float(accept_p[a-1]), a_saliency))
+                                
+                                # Intron purity & Acceptor Boundary Step-Derivative + Reading-Frame Lock
+                                _, int_mp = get_exon_metrics(d, a)
+                                up_a_s = max(d, a - 30)
+                                _, up_a_mp = get_exon_metrics(up_a_s, a)
+                                dn_a_e = min(L, a + 45)
+                                _, dn_a_mp = get_exon_metrics(a, dn_a_e)
+                                coding_rise = max(0.0, dn_a_mp - up_a_mp)
+                                next_f = (a - d_phase) % 3
+                                dn_f_mp = get_frame_mean(next_f, a, dn_a_e)
+
+                                a_saliency = (
+                                    (math.log(1.0 + 100.0 * ap) + 8.0 * ap) * (0.5 + ppt_ratio)
+                                    + 2.0 * coding_rise
+                                    + (3.0 * dn_f_mp if has_phase else 0.0)
+                                    - 3.5 * int_mp
+                                )
+                                valid_a.append((a, ap, a_saliency, dn_a_mp, dn_f_mp))
 
                             valid_a.sort(key=lambda x: x[2], reverse=True)
 
-                            for a, a_score, _ in valid_a[:4]:
+                            for a, a_score, _, dn_a_mp, dn_f_mp in valid_a[:4]:
                                 # Immediate Split-Codon Phase Pruning: Reject lethal in-frame nonsense stops
                                 if d_phase == 1 and d >= 1 and a + 2 <= L:
                                     split_codon = dna_upper[d - 1] + dna_upper[a:a + 2]
@@ -297,6 +345,13 @@ class TopologicalDAGDecoder:
                                     - coding_excision_penalty
                                 )
 
+                                # Phase-lock adjustment on downstream exon entry
+                                if has_phase:
+                                    if dn_a_mp > 0.20 and (dn_f_mp / dn_a_mp) < 0.22:
+                                        intron_gain -= 2.0
+                                    elif dn_f_mp >= max(0.25, p0 * 1.2):
+                                        intron_gain += 0.8 * dn_f_mp
+
                                 # Soft-margin bridging for high coding regions
                                 if e_mp >= max(0.30, p0 * 2.0):
                                     intron_gain += 0.5
@@ -321,46 +376,61 @@ class TopologicalDAGDecoder:
                 if not active_paths:
                     break
 
-            # Pareto Principle: Group by exon count and preserve top candidate of EACH topology
+            # Pareto Principle: Group by exon count and preserve top topologies per start codon
             if completed_for_s:
                 by_exon = {}
                 for c in completed_for_s:
                     k = c["exons"]
                     if k not in by_exon or c["dna_score"] > by_exon[k]["dna_score"]:
                         by_exon[k] = c
-                for c in by_exon.values():
-                    all_best_per_start.append(c)
+                top_for_s = sorted(by_exon.values(), key=lambda x: x["dna_score"], reverse=True)
+                kept_s = top_for_s[:4]
+                if 1 in by_exon and by_exon[1] not in kept_s:
+                    kept_s.append(by_exon[1])
+                all_best_per_start.extend(kept_s)
 
-        # Pareto-Frontier NMS in DNA space (only suppress within same exon count using locus span overlap)
+        # Pareto-Frontier NMS in DNA space (suppress redundant same-topology or near-identical coding loci)
         all_best_per_start.sort(key=lambda x: x["dna_score"], reverse=True)
         dna_retained: List[Dict] = []
         for c in all_best_per_start:
             cs, ce = c["spans"][0][0], c["spans"][-1][1]
             ov = False
             for r in dna_retained:
-                if c["exons"] == r["exons"]:
-                    rs, re = r["spans"][0][0], r["spans"][-1][1]
-                    s_ov = max(0, min(ce, re) - max(cs, rs))
-                    if s_ov > 0.35 * min(ce - cs, re - rs):
+                rs, re = r["spans"][0][0], r["spans"][-1][1]
+                s_ov = max(0, min(ce, re) - max(cs, rs))
+                if s_ov <= 0:
+                    continue
+                if c["exons"] == r["exons"] and s_ov > 0.35 * min(ce - cs, re - rs):
+                    ov = True
+                    break
+                if s_ov > 0.80 * min(ce - cs, re - rs):
+                    c_ov = compute_coding_overlap(c["spans"], r["spans"])
+                    if c_ov > 0.85 * max(c["len"], r["len"]):
                         ov = True
                         break
             if not ov:
                 dna_retained.append(c)
 
-        # Stage 2: ESM-2 Biophysical Scoring
-        t_esm = time.time()
-        scored: List[Dict] = []
+        # Stage 2: Batched ESM-2 Biophysical Scoring
+        valid_candidates = []
         for c in dna_retained:
             tx = self.operator.process_transcript(seq, c["spans"], strand="+")
             if tx.is_in_frame and not tx.has_internal_stop:
-                ed = oracle.score_transcript(tx)
-                energy = ed["total_energy"]
-                if energy <= self.energy_cutoff:
-                    c["energy"] = energy
-                    c["esm_cross_entropy"] = ed["esm_cross_entropy"]
-                    c["protein_len"] = len(tx.protein_sequence)
-                    c["score"] = c["dna_score"] - energy * 0.25
-                    scored.append(c)
+                valid_candidates.append((c, tx))
+
+        if valid_candidates and hasattr(oracle, "score_batch"):
+            oracle.score_batch([tx.protein_sequence for _, tx in valid_candidates], batch_size=16)
+
+        scored: List[Dict] = []
+        for c, tx in valid_candidates:
+            ed = oracle.score_transcript(tx)
+            energy = ed["total_energy"]
+            if energy <= self.energy_cutoff:
+                c["energy"] = energy
+                c["esm_cross_entropy"] = ed["esm_cross_entropy"]
+                c["protein_len"] = len(tx.protein_sequence)
+                c["score"] = c["dna_score"] - energy * 0.25
+                scored.append(c)
 
         # Final Intra-Strand NMS (ranked by joint dual-space score, suppressing nested/overlapping loci)
         scored.sort(key=lambda x: x["score"], reverse=True)
@@ -386,3 +456,4 @@ class TopologicalDAGDecoder:
                 final_retained.append(c)
 
         return final_retained
+

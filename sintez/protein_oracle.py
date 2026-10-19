@@ -115,8 +115,8 @@ class ProteinEnergyOracle:
                 "length": 0,
             }
 
-        # Remove any internal asterisks before passing to ESM (which expects standard AAs)
-        esm_seq = clean_seq.replace("*", "X")
+        # Remove any internal asterisks and cap at ESM-2 1022-residue context limit
+        esm_seq = clean_seq.replace("*", "X")[:1022]
         data = [("candidate", esm_seq)]
         _, _, batch_tokens = self.batch_converter(data)
         batch_tokens = batch_tokens.to(self.device)
@@ -132,11 +132,11 @@ class ProteinEnergyOracle:
             
             loss_fn = nn.CrossEntropyLoss(reduction="mean")
             esm_loss = loss_fn(pred_logits.reshape(-1, pred_logits.size(-1)), target.reshape(-1)).item()
-        except Exception as e:
+        except Exception:
             # Fallback for unexpected edge cases
             esm_loss = 25.0
 
-        # 3. Information-Theoretic Sequence Complexity
+        # 4. Information-Theoretic Sequence Complexity
         shannon_h = self.calculate_shannon_entropy(clean_seq)
         complexity_deficit = max(0.0, 3.2 - shannon_h)
         entropy_cost = float(complexity_deficit * 8.0)
@@ -160,7 +160,8 @@ class ProteinEnergyOracle:
     def score_transcript(self, tx) -> Dict[str, float]:
         """
         Evaluates a complete SplicedTranscript object, taking into account
-        triplet reading frame divisibility, start/stop validity, and ESM-2 perplexity.
+        triplet reading frame divisibility, start/stop validity, Shannon complexity,
+        and ESM-2 perplexity.
         """
         base_scores = self.score_sequence(tx.protein_sequence)
         
@@ -168,6 +169,7 @@ class ProteinEnergyOracle:
         start_cost = 50.0 if not tx.has_valid_start else 0.0
         stop_cost = 50.0 if not tx.has_valid_stop else 0.0
         internal_stop_cost = self.ptc_penalty if tx.has_internal_stop else 0.0
+        entropy_cost = base_scores.get("entropy_penalty", 0.0)
         
         total_energy = (
             base_scores["esm_cross_entropy"]
@@ -176,11 +178,13 @@ class ProteinEnergyOracle:
             + stop_cost
             + internal_stop_cost
             + base_scores["length_penalty"]
+            + entropy_cost
         )
         
         return {
             "total_energy": float(total_energy),
             "esm_cross_entropy": base_scores["esm_cross_entropy"],
+            "entropy_penalty": float(entropy_cost),
             "frame_penalty": frame_cost,
             "start_penalty": start_cost,
             "stop_penalty": stop_cost,
@@ -190,7 +194,71 @@ class ProteinEnergyOracle:
             "length": base_scores["length"],
         }
 
-    def score_batch(self, sequences: List[str]) -> List[Dict[str, float]]:
-        """Score multiple candidate protein sequences."""
+    @torch.no_grad()
+    def score_batch(self, sequences: List[str], batch_size: int = 16) -> List[Dict[str, float]]:
+        """
+        Scores multiple candidate protein sequences using length-sorted mini-batches
+        to minimize padding overhead and maximize SIMD/GPU throughput.
+        """
+        uncached = []
+        seen = set()
+        for seq in sequences:
+            if seq not in self._cache and seq not in seen:
+                seen.add(seq)
+                clean = seq.rstrip("*")
+                if len(clean) == 0:
+                    self.score_sequence(seq)
+                else:
+                    uncached.append((seq, clean, clean.replace("*", "X")[:1022]))
+
+        # Sort by ESM-2 sequence length to minimize batch padding waste
+        uncached.sort(key=lambda x: len(x[2]))
+        loss_fn = nn.CrossEntropyLoss(reduction="none")
+
+        for i in range(0, len(uncached), batch_size):
+            chunk = uncached[i : i + batch_size]
+            data = [(f"cand_{j}", item[2]) for j, item in enumerate(chunk)]
+            try:
+                _, _, batch_tokens = self.batch_converter(data)
+                batch_tokens = batch_tokens.to(self.device)
+                results = self.esm_model(batch_tokens, return_contacts=False)
+                logits = results["logits"]  # (B, max_L + 2, V)
+
+                for j, (raw_seq, clean_seq, esm_seq) in enumerate(chunk):
+                    seq_len = len(esm_seq)
+                    target_j = batch_tokens[j, 1 : 1 + seq_len]
+                    logits_j = logits[j, 1 : 1 + seq_len, :]
+                    esm_loss = loss_fn(logits_j, target_j).mean().item()
+
+                    has_internal_stop = "*" in clean_seq
+                    ptc_cost = self.ptc_penalty if has_internal_stop else 0.0
+                    full_len = len(clean_seq)
+                    len_cost = float(max(0, self.min_length - full_len)) * self.short_penalty
+                    shannon_h = self.calculate_shannon_entropy(clean_seq)
+                    entropy_cost = float(max(0.0, 3.2 - shannon_h) * 8.0)
+                    total_energy = esm_loss + ptc_cost + len_cost + entropy_cost
+
+                    self._cache[raw_seq] = {
+                        "total_energy": float(total_energy),
+                        "esm_cross_entropy": float(esm_loss),
+                        "shannon_entropy": float(shannon_h),
+                        "entropy_penalty": float(entropy_cost),
+                        "ptc_penalty": float(ptc_cost),
+                        "length_penalty": float(len_cost),
+                        "is_valid_orf": (not has_internal_stop) and (full_len >= self.min_length),
+                        "length": full_len,
+                    }
+            except Exception:
+                # Fallback to single-sequence evaluation on error
+                for raw_seq, _, _ in chunk:
+                    self.score_sequence(raw_seq)
+
         return [self.score_sequence(seq) for seq in sequences]
+
+    @torch.no_grad()
+    def score_transcripts_batch(self, transcripts: List, batch_size: int = 16) -> List[Dict[str, float]]:
+        """Pre-warms cache with batched ESM-2 inference and returns transcript energy dicts."""
+        self.score_batch([tx.protein_sequence for tx in transcripts], batch_size=batch_size)
+        return [self.score_transcript(tx) for tx in transcripts]
+
 

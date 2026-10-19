@@ -77,3 +77,47 @@ def test_polypyrimidine_tract_density():
     purine_ratio = sum(1 for c in purine_seq if c in {"C", "T"}) / len(purine_seq)
     assert purine_ratio == 0.0
 
+
+def test_phase_coherent_exon_scoring():
+    import numpy as np
+
+    class DummyOracle:
+        def score_batch(self, seqs, batch_size=16):
+            return [{"total_energy": 6.0, "esm_cross_entropy": 2.0, "entropy_bits": 4.0, "entropy_penalty": 0.0, "ptc_penalty": 0.0} for _ in seqs]
+
+        def score_transcript(self, tx):
+            return {"total_energy": 6.0, "esm_cross_entropy": 2.0, "entropy_bits": 4.0, "entropy_penalty": 0.0, "ptc_penalty": 0.0}
+
+    # Construct a 600 bp sequence with a 300 bp ORF at pos 60..360 (frame 0: 60 % 3 == 0)
+    # and a competing 300 bp ORF at pos 61..361 (frame 1: 61 % 3 == 1)
+    seq_list = list("A" * 600)
+    # Frame 0 ORF: ATG at 60, sense codons (GCT), TAA at 357..360
+    seq_list[60:63] = list("ATG")
+    for p in range(63, 357, 3):
+        seq_list[p:p+3] = list("GCT")
+    seq_list[357:360] = list("TAA")
+
+    seq = "".join(seq_list)
+    L = len(seq)
+    preds = {
+        "start": np.zeros(L, dtype=np.float32),
+        "stop": np.zeros(L, dtype=np.float32),
+        "donor": np.zeros(L, dtype=np.float32),
+        "acceptor": np.zeros(L, dtype=np.float32),
+        "coding": np.zeros(L, dtype=np.float32),
+        "phase": np.zeros((3, L), dtype=np.float32),
+    }
+    preds["start"][60] = 0.85
+    preds["stop"][357] = 0.85
+    preds["coding"][60:360] = 0.90
+    # Phase track strongly concentrated in reading frame 0 (60 % 3 == 0)
+    for pos in range(60, 360):
+        c_off = (pos - 60) % 3
+        f_idx = (pos - c_off) % 3
+        preds["phase"][f_idx, pos] = 0.88
+
+    decoder = TopologicalDAGDecoder(min_single_len=240, energy_cutoff=13.0)
+    models = decoder.decode_strand(seq, preds, DummyOracle(), strand_label="+")
+    assert len(models) == 1
+    assert models[0]["spans"] == [(60, 360)]
+
