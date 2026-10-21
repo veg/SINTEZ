@@ -59,11 +59,11 @@ def run_windowed_inference(
         with torch.no_grad():
             out = backbone(one_hot)
 
-        span_coding = out["span_probs"][:, 2, :].squeeze().cpu().numpy()
-        p_start = out["start_prob"].squeeze().cpu().numpy()
-        p_stop = out["stop_prob"].squeeze().cpu().numpy()
-        p_donor = out["donor_prob"].squeeze().cpu().numpy()
-        p_accept = out["acceptor_prob"].squeeze().cpu().numpy()
+        span_coding = out["span_probs"][:, 2, :].reshape(-1).cpu().numpy()
+        p_start = out["start_prob"].reshape(-1).cpu().numpy()
+        p_stop = out["stop_prob"].reshape(-1).cpu().numpy()
+        p_donor = out["donor_prob"].reshape(-1).cpu().numpy()
+        p_accept = out["acceptor_prob"].reshape(-1).cpu().numpy()
 
         raw_sp = out.get("span_probs_raw", out["span_probs"])
         if raw_sp.shape[1] >= 7:
@@ -92,7 +92,7 @@ def run_windowed_inference(
         if "foldability_prob" in out:
             if "foldability" not in preds:
                 preds["foldability"] = np.zeros(L, dtype=np.float32)
-            preds["foldability"][w_start:w_end] += out["foldability_prob"].squeeze().cpu().numpy() * weight
+            preds["foldability"][w_start:w_end] += out["foldability_prob"].reshape(-1).cpu().numpy() * weight
         counts[w_start:w_end] += weight
 
     counts = np.maximum(counts, 1e-6)
@@ -147,7 +147,15 @@ def cmd_predict(args):
         chrom_seq = "".join(l.strip() for l in f if not l.startswith(">"))
     print(f"[*] Loaded FASTA Sequence: {len(chrom_seq):,} bp.")
 
-    ckpt_path = Path(args.checkpoint) if args.checkpoint else Path(__file__).parent.parent / "models" / "sintez_backbone_multiphyla.pt"
+    models_dir = Path(__file__).parent.parent / "models"
+    if args.checkpoint:
+        ckpt_path = Path(args.checkpoint)
+    elif (models_dir / "sintez_backbone_v3_multiphyla_swa.pt").exists():
+        ckpt_path = models_dir / "sintez_backbone_v3_multiphyla_swa.pt"
+    elif (models_dir / "sintez_backbone_v3_multiphyla.pt").exists():
+        ckpt_path = models_dir / "sintez_backbone_v3_multiphyla.pt"
+    else:
+        ckpt_path = models_dir / "sintez_backbone_multiphyla.pt"
     if not ckpt_path.exists():
         raise FileNotFoundError(f"Checkpoint not found at: {ckpt_path}")
 

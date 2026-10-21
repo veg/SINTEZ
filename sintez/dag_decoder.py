@@ -67,10 +67,10 @@ class TopologicalDAGDecoder:
         beam_width: int = 8,
         beam_width_per_phase: Optional[int] = None,
         lambda_intron: float = 4.0,
-        min_intron_gain: float = -1.5,
-        min_donor_prob: float = 0.008,
-        min_accept_prob: float = 0.008,
-        min_start_prob: float = 0.001,
+        min_intron_gain: float = 0.0,
+        min_donor_prob: float = 0.025,
+        min_accept_prob: float = 0.025,
+        min_start_prob: float = 0.002,
         energy_cutoff: float = 14.0,
     ):
         self.min_single_len = min_single_len
@@ -110,9 +110,11 @@ class TopologicalDAGDecoder:
         coding_p = preds["coding"]
 
         # 1. Prefix-sum arrays for O(1) log-odds and coding probability integration
-        # Empirical background calibration: adapts neutral point dynamically to GC regime
-        p0_est = float(np.percentile(coding_p, 30.0)) if L > 1000 else 0.15
-        p0 = max(0.08, min(p0_est, 0.38))
+        # Empirical background calibration: adapts neutral point and active coding scale dynamically to regime
+        p30_est = float(np.percentile(coding_p, 30.0)) if L > 1000 else 0.15
+        p85_est = float(np.percentile(coding_p, 85.0)) if L > 1000 else 0.70
+        cod_scale = min(1.0, max(0.25, p85_est / 0.65))
+        p0 = max(0.025, min(p30_est, 0.35, p85_est * 0.28))
         llr_offset = math.log(p0 / (1.0 - p0))
 
         eps = 1e-4
@@ -137,8 +139,11 @@ class TopologicalDAGDecoder:
         # Optional neural foldability / coding quality prefix sum (Foundation v3)
         has_fold = "foldability" in preds and preds["foldability"] is not None
         cumsum_fold = np.zeros(L + 1, dtype=np.float64)
+        fold_scale = 1.0
         if has_fold:
             cumsum_fold[1:] = np.cumsum(preds["foldability"])
+            f85_est = float(np.percentile(preds["foldability"], 85.0)) if L > 1000 else 0.65
+            fold_scale = min(1.0, max(0.15, f85_est / 0.65))
 
         def get_exon_metrics(s: int, e: int) -> Tuple[float, float]:
             if e <= s:
@@ -165,10 +170,12 @@ class TopologicalDAGDecoder:
                 stop_positions[pos % 3].append(pos)
 
         # 3. Pre-filter and sort candidate donor and acceptor sites
-        raw_donors = np.where(donor_p >= self.min_donor_prob)[0]
+        d_thresh = max(self.min_donor_prob, 0.025 * cod_scale)
+        a_thresh = max(self.min_accept_prob, 0.025 * cod_scale)
+        raw_donors = np.where(donor_p >= d_thresh)[0]
         donor_list = [int(d) for d in raw_donors if d < L - 2 and dna_upper[d:d+2] in {"GT", "GC"}]
 
-        raw_acceptors = np.where(accept_p >= self.min_accept_prob)[0]
+        raw_acceptors = np.where(accept_p >= a_thresh)[0]
         acceptor_list = [int(a + 1) for a in raw_acceptors if 0 < a < L - 1 and dna_upper[a-1:a+1] == "AG"]
 
         # 4. Candidate Starts: Primary threshold + secondary relative peak support for non-canonical contexts
@@ -185,14 +192,14 @@ class TopologicalDAGDecoder:
             # Secondary relative peaks for non-canonical/GC-rich Kozak contexts
             if len(cand_starts_set) < max(50, L // 3000):
                 for idx, i in enumerate(atg_indices):
-                    if start_p[i] >= 0.0003:
+                    if start_p[i] >= 0.0005:
                         _, dn_cod = get_exon_metrics(i, min(L, i + 120))
-                        if dn_cod >= max(0.40, p0 * 2.0):
+                        if dn_cod >= max(0.45 * cod_scale, p0 * 2.0):
                             cand_starts_set.add(i)
 
         cand_starts = sorted(list(cand_starts_set))
         all_best_per_start = []
-        min_cod_th = max(0.30, p0 * 1.35)
+        min_cod_th = max(0.32 * cod_scale, p0 * 1.40)
 
         for s in cand_starts:
             init_signal = math.log(1.0 + 50.0 * max(float(start_p[s]), 0.003))
@@ -216,19 +223,30 @@ class TopologicalDAGDecoder:
                     e = first_stop + 3
                     ex_len = e - last_end
                     t_len = total_len + ex_len
+                    stop_p_val = float(stop_p[first_stop])
 
                     # Option A: In-frame Stop Codon Termination
                     is_single_exon = (depth == 1)
                     min_len_req = self.min_single_len if is_single_exon else self.min_multi_len
-                    if t_len >= min_len_req:
+                    # Terminal exon of a multi-exon gene must have valid coding & frame density
+                    _, term_mp = get_exon_metrics(last_end, e)
+                    term_f_mp = get_frame_mean((last_end - phase) % 3, last_end, e) if has_phase else term_mp
+                    valid_term = is_single_exon or (
+                        ex_len >= 18
+                        and term_mp >= max(0.26 * cod_scale, p0 * 1.35)
+                        and (not has_phase or (term_f_mp / max(1e-4, term_mp)) >= 0.24)
+                    )
+                    if t_len >= min_len_req and valid_term:
                         cand_spans = spans + [(last_end, e)]
                         tot_llr = 0.0
                         tot_p_sum = 0.0
                         tot_frame_p_sum = 0.0
                         tot_fold_sum = 0.0
                         cur_ph = 0
+                        min_ex_mp = 1.0
                         for es, ee in cand_spans:
                             s_llr, s_mp = get_exon_metrics(es, ee)
+                            min_ex_mp = min(min_ex_mp, s_mp)
                             tot_llr += s_llr
                             tot_p_sum += s_mp * (ee - es)
                             if has_phase:
@@ -242,25 +260,38 @@ class TopologicalDAGDecoder:
                         frame_purity = (mean_frame_cod / max(1e-4, mean_cod)) if has_phase else 1.0
                         mean_fold = (tot_fold_sum / max(1, t_len)) if has_fold else mean_cod
 
-                        # Single-exon genes lack splicing signals, requiring stricter coding purity
-                        min_cod_req = max(0.48, p0 * 1.7) if is_single_exon else min_cod_th
+                        min_cod_req = max(0.45 * cod_scale, p0 * 1.6) if is_single_exon else min_cod_th
                         min_llr_req = 1.0 if is_single_exon else 0.0
 
-                        stop_score = math.log(1.0 + 50.0 * float(stop_p[first_stop]))
+                        stop_score = math.log(1.0 + 50.0 * stop_p_val)
                         len_evidence = 2.0 * math.log(t_len) - max(0.0, (240 - t_len) / 20.0)
 
-                        total_signal = cum_signal + stop_score
+                        # Boundary signal normalized by transition count so superfluous introns do not inflate score
+                        n_ex = len(cand_spans)
+                        mean_junc_signal = (cum_signal + stop_score) / (1.0 + 0.65 * (n_ex - 1))
                         norm_llr = tot_llr / math.sqrt(max(1, t_len))
-                        frame_bonus = (2.5 * mean_frame_cod) if has_phase else 0.0
-                        fold_bonus = (2.0 * mean_fold) if has_fold else 0.0
-                        dna_score = total_signal + norm_llr * 0.5 + mean_cod * 6.0 + frame_bonus + fold_bonus + len_evidence
+                        frame_bonus = (3.5 * mean_frame_cod) if has_phase else 0.0
+                        fold_bonus = (2.5 * mean_fold) if has_fold else 0.0
+                        dna_score = (
+                            mean_junc_signal
+                            + norm_llr * 0.65
+                            + mean_cod * 6.5
+                            + frame_bonus
+                            + fold_bonus
+                            + len_evidence
+                        )
 
-                        # Filter candidates with net positive coding evidence, sufficient coding density, and reading-frame coherence
-                        if tot_llr > min_llr_req and mean_cod >= min_cod_req and frame_purity >= 0.25 and (not has_fold or mean_fold >= 0.25):
+                        if (
+                            tot_llr > min_llr_req
+                            and mean_cod >= min_cod_req
+                            and min_ex_mp >= max(0.06, 0.25 * cod_scale)
+                            and frame_purity >= 0.28
+                            and (not has_fold or mean_fold >= max(0.06, 0.28 * fold_scale))
+                        ):
                             completed_for_s.append({
                                 "spans": cand_spans,
                                 "len": t_len,
-                                "exons": len(cand_spans),
+                                "exons": n_ex,
                                 "mean_coding": mean_cod,
                                 "dna_score": dna_score,
                             })
@@ -275,6 +306,9 @@ class TopologicalDAGDecoder:
                         for idx in range(d_i0, d_i1):
                             d = donor_list[idx]
                             d_p = float(donor_p[d])
+                            # Prevent bypassing a high-confidence in-frame stop codon just before it unless donor is stronger
+                            if first_stop - d <= 45 and stop_p_val >= 0.30 and d_p < stop_p_val * 1.15:
+                                continue
                             e_llr, e_mp = get_exon_metrics(last_end, d)
                             e_f_mp = get_frame_mean(f_ex, last_end, d)
                             
@@ -285,20 +319,19 @@ class TopologicalDAGDecoder:
                             _, dn_mp = get_exon_metrics(d, dn_e)
                             coding_drop = max(0.0, up_mp - dn_mp)
 
-                            # Saliency combines point sensor, coding step-down, and reading-frame coherence
                             saliency = (
                                 math.log(1.0 + 100.0 * d_p)
                                 + 8.0 * d_p
-                                + 3.0 * coding_drop
+                                + 3.5 * coding_drop
                                 + 2.0 * e_mp
-                                + (2.5 * e_f_mp if has_phase else 0.0)
+                                + (3.0 * e_f_mp if has_phase else 0.0)
                             )
-                            if e_mp >= max(0.20, p0 * 1.5) and (not has_phase or (e_f_mp / max(1e-4, e_mp)) >= 0.20):
+                            if e_mp >= max(0.06, 0.28 * cod_scale, p0 * 1.5) and (not has_phase or (e_f_mp / max(1e-4, e_mp)) >= 0.25):
                                 valid_donors.append((d, d_p, e_llr, e_mp, saliency))
 
                         valid_donors.sort(key=lambda x: x[4], reverse=True)
 
-                        for d, d_score, e_llr, e_mp, _ in valid_donors[:6]:
+                        for d, d_score, e_llr, e_mp, _ in valid_donors[:5]:
                             d_phase = (phase + (d - last_end)) % 3
                             next_len = total_len + (d - last_end)
                             next_spans = spans + [(last_end, d)]
@@ -311,12 +344,14 @@ class TopologicalDAGDecoder:
                             for idx in range(a_i0, a_i1):
                                 a = acceptor_list[idx]
                                 ap = float(accept_p[a-1])
-                                # PPT (polypyrimidine tract) density in [-25, -4] upstream window
+                                # Intron purity & Acceptor Boundary Step-Derivative + Reading-Frame Lock
+                                _, int_mp = get_exon_metrics(d, a)
+                                # Reject false in-exon introns that excise strongly coding sequence
+                                if int_mp > 0.45:
+                                    continue
                                 ppt_win = dna_upper[max(0, a - 25):max(0, a - 4)]
                                 ppt_ratio = (sum(1 for c in ppt_win if c in {'C', 'T'}) / len(ppt_win)) if len(ppt_win) >= 10 else 0.5
                                 
-                                # Intron purity & Acceptor Boundary Step-Derivative + Reading-Frame Lock
-                                _, int_mp = get_exon_metrics(d, a)
                                 up_a_s = max(d, a - 30)
                                 _, up_a_mp = get_exon_metrics(up_a_s, a)
                                 dn_a_e = min(L, a + 45)
@@ -327,15 +362,15 @@ class TopologicalDAGDecoder:
 
                                 a_saliency = (
                                     (math.log(1.0 + 100.0 * ap) + 8.0 * ap) * (0.5 + ppt_ratio)
-                                    + 2.0 * coding_rise
-                                    + (3.0 * dn_f_mp if has_phase else 0.0)
-                                    - 3.5 * int_mp
+                                    + 2.5 * coding_rise
+                                    + (3.5 * dn_f_mp if has_phase else 0.0)
+                                    - 5.0 * int_mp
                                 )
-                                valid_a.append((a, ap, a_saliency, dn_a_mp, dn_f_mp))
+                                valid_a.append((a, ap, a_saliency, dn_a_mp, dn_f_mp, int_mp))
 
                             valid_a.sort(key=lambda x: x[2], reverse=True)
 
-                            for a, a_score, _, dn_a_mp, dn_f_mp in valid_a[:4]:
+                            for a, a_score, _, dn_a_mp, dn_f_mp, int_mp in valid_a[:4]:
                                 # Immediate Split-Codon Phase Pruning: Reject lethal in-frame nonsense stops
                                 if d_phase == 1 and d >= 1 and a + 2 <= L:
                                     split_codon = dna_upper[d - 1] + dna_upper[a:a + 2]
@@ -351,7 +386,7 @@ class TopologicalDAGDecoder:
                                 
                                 # Coding-excision penalty prevents excising high-scoring coding sequence
                                 int_llr, _ = get_exon_metrics(d, a)
-                                coding_excision_penalty = max(0.0, int_llr * 0.5)
+                                coding_excision_penalty = max(0.0, int_llr * 0.6) + 2.5 * int_mp
 
                                 intron_gain = (
                                     math.log(1.0 + 50.0 * d_score)
@@ -363,19 +398,16 @@ class TopologicalDAGDecoder:
 
                                 # Phase-lock adjustment on downstream exon entry
                                 if has_phase:
-                                    if dn_a_mp > 0.20 and (dn_f_mp / dn_a_mp) < 0.22:
-                                        intron_gain -= 2.0
-                                    elif dn_f_mp >= max(0.25, p0 * 1.2):
+                                    if dn_a_mp > 0.20 and (dn_f_mp / dn_a_mp) < 0.24:
+                                        intron_gain -= 2.5
+                                    elif dn_f_mp >= max(0.28, p0 * 1.2):
                                         intron_gain += 0.8 * dn_f_mp
 
-                                # Soft-margin bridging for high coding regions
-                                if e_mp >= max(0.30, p0 * 2.0):
-                                    intron_gain += 0.5
-
-                                if intron_gain > self.min_intron_gain:
+                                min_ig_req = max(self.min_intron_gain, -0.3)
+                                if intron_gain > min_ig_req:
                                     new_cum_signal = cum_signal + intron_gain
                                     new_cum_llr = cum_llr + e_llr
-                                    beam_score = new_cum_signal + (new_cum_llr / math.sqrt(max(1, next_len))) * 0.5
+                                    beam_score = (new_cum_signal / (1.0 + 0.5 * exon_count)) + (new_cum_llr / math.sqrt(max(1, next_len))) * 0.65
                                     next_paths.append((next_spans, a, d_phase, exon_count + 1, next_len, new_cum_signal, new_cum_llr, beam_score))
 
                 # Phase-decoupled beam retention: top K per phase
@@ -400,7 +432,7 @@ class TopologicalDAGDecoder:
                     if k not in by_exon or c["dna_score"] > by_exon[k]["dna_score"]:
                         by_exon[k] = c
                 top_for_s = sorted(by_exon.values(), key=lambda x: x["dna_score"], reverse=True)
-                kept_s = top_for_s[:4]
+                kept_s = top_for_s[:3]
                 if 1 in by_exon and by_exon[1] not in kept_s:
                     kept_s.append(by_exon[1])
                 all_best_per_start.extend(kept_s)
@@ -416,12 +448,12 @@ class TopologicalDAGDecoder:
                 s_ov = max(0, min(ce, re) - max(cs, rs))
                 if s_ov <= 0:
                     continue
-                if c["exons"] == r["exons"] and s_ov > 0.35 * min(ce - cs, re - rs):
+                if c["exons"] == r["exons"] and s_ov > 0.30 * min(ce - cs, re - rs):
                     ov = True
                     break
-                if s_ov > 0.80 * min(ce - cs, re - rs):
+                if s_ov > 0.70 * min(ce - cs, re - rs):
                     c_ov = compute_coding_overlap(c["spans"], r["spans"])
-                    if c_ov > 0.85 * max(c["len"], r["len"]):
+                    if c_ov > 0.75 * min(c["len"], r["len"]):
                         ov = True
                         break
             if not ov:
@@ -445,7 +477,7 @@ class TopologicalDAGDecoder:
                 c["energy"] = energy
                 c["esm_cross_entropy"] = ed["esm_cross_entropy"]
                 c["protein_len"] = len(tx.protein_sequence)
-                c["score"] = c["dna_score"] - energy * 0.25
+                c["score"] = c["dna_score"] - energy * 0.30
                 scored.append(c)
 
         # Final Intra-Strand NMS (ranked by joint dual-space score, suppressing nested/overlapping loci)
@@ -458,14 +490,12 @@ class TopologicalDAGDecoder:
             for f in final_retained:
                 fs, fe = f["spans"][0][0], f["spans"][-1][1]
                 s_ov = max(0, min(ce, fe) - max(cs, fs))
-                # Suppress if genomic span overlap > 35% of either candidate locus
-                if s_ov > 0.35 * min(ce - cs, fe - fs):
+                if s_ov > 0.25 * min(ce - cs, fe - fs):
                     ov = True
                     break
-                # Also suppress on direct coding collision > 20%
                 f_len = sum(e - s for s, e in f["spans"])
                 c_ov = compute_coding_overlap(c["spans"], f["spans"])
-                if c_ov > 0.20 * min(c_len, f_len):
+                if c_ov > 0.15 * min(c_len, f_len):
                     ov = True
                     break
             if not ov:

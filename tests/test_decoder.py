@@ -28,7 +28,7 @@ def test_decoder_default_parameters():
     assert decoder.max_exons == 16
     assert decoder.min_internal_exon_len == 15
     assert decoder.beam_width == 8
-    assert decoder.min_intron_gain == -1.5
+    assert decoder.min_intron_gain == 0.0
 
 
 def test_jacobson_stockmayer_loop_penalty():
