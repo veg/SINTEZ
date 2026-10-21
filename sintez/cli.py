@@ -89,12 +89,18 @@ def run_windowed_inference(
         preds["acceptor"][w_start:w_end] += p_accept * weight
         preds["coding"][w_start:w_end] += span_coding * weight
         preds["phase"][:, w_start:w_end] += p_3 * weight[np.newaxis, :]
+        if "foldability_prob" in out:
+            if "foldability" not in preds:
+                preds["foldability"] = np.zeros(L, dtype=np.float32)
+            preds["foldability"][w_start:w_end] += out["foldability_prob"].squeeze().cpu().numpy() * weight
         counts[w_start:w_end] += weight
 
     counts = np.maximum(counts, 1e-6)
     for k in ("start", "stop", "donor", "acceptor", "coding"):
         preds[k] /= counts
     preds["phase"] /= counts[np.newaxis, :]
+    if "foldability" in preds:
+        preds["foldability"] /= counts
 
     return preds
 
@@ -147,13 +153,7 @@ def cmd_predict(args):
 
     print(f"[+] Loading SINTEZ Backbone from {ckpt_path.resolve()}...")
     state_dict = torch.load(ckpt_path, map_location=device)
-    span_w = state_dict.get("span_head.weight")
-    if span_w is not None and span_w.shape[0] == 7:
-        hidden_dim = span_w.shape[1]
-        use_gru = any(k.startswith("gru.") for k in state_dict.keys())
-        cfg = DNAEncoderConfig.foundation_v2(hidden_dim=hidden_dim, num_span_classes=7, use_gru=use_gru)
-    else:
-        cfg = DNAEncoderConfig(in_channels=4, hidden_dim=64, kernel_size=7, norm_window_size=201, dropout=0.1)
+    cfg = DNAEncoderConfig.from_state_dict(state_dict)
     backbone = CompositionNormalizedBackbone(cfg).to(device)
     backbone.load_state_dict(state_dict)
     backbone.eval()

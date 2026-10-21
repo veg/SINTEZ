@@ -55,13 +55,22 @@ def parse_gff_transcripts(
     prefix: str,
     max_multi: int = 3000,
     max_single: int = 1500,
-    max_len: int = 6000,
+    max_len: int = 10000,
     pad: int = 200,
+    random_pad_range: Optional[Tuple[int, int]] = (400, 1800),
     seed: int = 42,
 ) -> Tuple[List[GenomicGeneSample], List[GenomicGeneSample]]:
     """
     Parses verified protein-coding transcripts from a GFF3 file and returns
     balanced lists of multi-exon and single-exon GenomicGeneSample objects.
+
+    Key Training Improvements:
+    1. Random asymmetric flanking context (`random_pad_range=(400, 1800)` bp) eliminates
+       the fixed `pad=200` start/stop positional shortcut and ensures the 2,001 bp
+       composition normalization window sees authentic genomic context.
+    2. Labels ALL co-directional verified coding genes (`multi_gene_spans`) that fall inside
+       each extracted genomic window so neighboring genes in gene-dense genomes are not
+       falsely penalized as intergenic background.
     """
     tx_cds = defaultdict(list)
     tx_info = {}
@@ -91,51 +100,186 @@ def parse_gff_transcripts(
                         tx_info[parent] = (chrom, strand, gene_name or parent)
 
     operator = SplicedTranslationOperator()
-    multi_genes = []
-    single_genes = []
-
-    tx_keys = list(tx_cds.keys())
     rng = random.Random(seed)
-    rng.shuffle(tx_keys)
 
-    for tx_id in tx_keys:
-        intervals = tx_cds[tx_id]
+    # First pass: index all biologically valid transcripts per (chrom, strand) for multi-gene window labeling
+    valid_by_chrom_strand: Dict[Tuple[str, str], List[Tuple[int, int, str, List[Tuple[int, int]]]]] = defaultdict(list)
+    for tx_id, intervals in tx_cds.items():
         chrom, strand, gene_name = tx_info[tx_id]
         if chrom not in chroms:
             continue
         chr_seq = chroms[chrom]
         intervals.sort(key=lambda x: x[0])
         spans = [(s - 1, e) for s, e in intervals]
+        g_s, g_e = spans[0][0], spans[-1][1]
+        if g_e - g_s > max_len or g_e - g_s < 90 or g_s < 0 or g_e > len(chr_seq):
+            continue
+        tx = operator.process_transcript(chr_seq[g_s:g_e], [(s - g_s, e - g_s) for s, e in spans], strand=strand)
+        if tx.is_in_frame and not tx.has_internal_stop and len(tx.protein_sequence) >= 30:
+            valid_by_chrom_strand[(chrom, strand)].append((g_s, g_e, gene_name, spans))
 
-        l_s = max(0, spans[0][0] - pad)
-        l_e = min(len(chr_seq), spans[-1][1] + pad)
+    # Deduplicate overlapping isoforms per locus (keep longest coding isoform per locus)
+    dedup_by_chrom_strand: Dict[Tuple[str, str], List[Tuple[int, int, str, List[Tuple[int, int]]]]] = defaultdict(list)
+    for key, items in valid_by_chrom_strand.items():
+        items.sort(key=lambda x: (x[0], -(x[1] - x[0])))
+        kept = []
+        for g_s, g_e, g_name, spans in items:
+            if kept and max(0, min(g_e, kept[-1][1]) - max(g_s, kept[-1][0])) > 0.30 * min(g_e - g_s, kept[-1][1] - kept[-1][0]):
+                continue
+            kept.append((g_s, g_e, g_name, spans))
+        dedup_by_chrom_strand[key] = kept
+
+    all_loci = []
+    for (chrom, strand), items in dedup_by_chrom_strand.items():
+        for g_s, g_e, g_name, spans in items:
+            all_loci.append((chrom, strand, g_s, g_e, g_name, spans))
+    rng.shuffle(all_loci)
+
+    multi_genes = []
+    single_genes = []
+
+    for chrom, strand, g_s, g_e, gene_name, spans in all_loci:
+        is_multi = len(spans) > 1
+        if is_multi and len(multi_genes) >= max_multi:
+            continue
+        if not is_multi and len(single_genes) >= max_single:
+            continue
+
+        chr_seq = chroms[chrom]
+        if random_pad_range is not None:
+            pad_left = rng.randint(random_pad_range[0], random_pad_range[1])
+            pad_right = rng.randint(random_pad_range[0], random_pad_range[1])
+        else:
+            pad_left = pad_right = pad
+
+        l_s = max(0, g_s - pad_left)
+        l_e = min(len(chr_seq), g_e + pad_right)
         locus_len = l_e - l_s
-        if locus_len > max_len or locus_len < 100:
+        if locus_len > max_len or locus_len < 150:
             continue
 
         locus_dna = chr_seq[l_s:l_e]
         rel_spans = [(s - l_s, e - l_s) for s, e in spans]
 
-        # Biological validation: verify mature spliced peptide has valid start, in-frame, no internal stops
-        tx = operator.process_transcript(locus_dna, rel_spans, strand=strand)
-        if tx.is_in_frame and not tx.has_internal_stop and len(tx.protein_sequence) >= 30:
-            sample = GenomicGeneSample(
-                dna_sequence=locus_dna,
-                exon_spans=rel_spans,
-                strand=strand,
-                gene_id=f"{prefix}_{gene_name}",
-            )
-            if len(spans) > 1:
-                if len(multi_genes) < max_multi:
-                    multi_genes.append(sample)
-            else:
-                if len(single_genes) < max_single:
-                    single_genes.append(sample)
+        # Collect all co-directional valid genes completely contained inside [l_s, l_e]
+        co_genes_spans = []
+        for o_s, o_e, _, o_spans in dedup_by_chrom_strand[(chrom, strand)]:
+            if o_s >= l_s and o_e <= l_e:
+                co_genes_spans.append([(s - l_s, e - l_s) for s, e in o_spans])
+        if not co_genes_spans:
+            co_genes_spans = [rel_spans]
+
+        sample = GenomicGeneSample(
+            dna_sequence=locus_dna,
+            exon_spans=rel_spans,
+            strand=strand,
+            gene_id=f"{prefix}_{gene_name}",
+            multi_gene_spans=co_genes_spans,
+        )
+        if is_multi:
+            multi_genes.append(sample)
+        else:
+            single_genes.append(sample)
 
         if len(multi_genes) >= max_multi and len(single_genes) >= max_single:
             break
 
     return multi_genes, single_genes
+
+
+def extract_antisense_negative_windows(
+    gff_path: Path,
+    chroms: Dict[str, str],
+    prefix: str,
+    target_count: int,
+    pad_range: Tuple[int, int] = (300, 1200),
+    max_len: int = 8000,
+    seed: int = 42,
+) -> List[GenomicGeneSample]:
+    """
+    Extracts hard-negative antisense windows: genomic windows containing a verified protein-coding
+    gene on the OPPOSITE strand and zero coding exons on the queried forward strand.
+    Training on these windows directly suppresses reverse-complement 'shadow ORF' false positives
+    (driven by 3-base wobble periodicity leaking across strands).
+    """
+    rng = random.Random(seed + 101)
+    strand_intervals = {"+": defaultdict(list), "-": defaultdict(list)}
+    open_fn = gzip.open if str(gff_path).endswith(".gz") else open
+    with open_fn(gff_path, "rt", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            if line.startswith("#") or not line.strip():
+                continue
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) >= 7 and parts[2] in ("gene", "CDS", "mRNA", "exon"):
+                chrom, s, e, strand = parts[0], int(parts[3]) - 1, int(parts[4]), parts[6]
+                if strand in ("+", "-"):
+                    strand_intervals[strand][chrom].append((s, e))
+
+    def merge_iv(iv_list: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
+        if not iv_list:
+            return []
+        s_iv = sorted(iv_list, key=lambda x: x[0])
+        m = [[s_iv[0][0], s_iv[0][1]]]
+        for s, e in s_iv[1:]:
+            if s <= m[-1][1]:
+                m[-1][1] = max(m[-1][1], e)
+            else:
+                m.append([s, e])
+        return [(x[0], x[1]) for x in m]
+
+    merged_plus = {c: merge_iv(ivs) for c, ivs in strand_intervals["+"].items()}
+    merged_minus = {c: merge_iv(ivs) for c, ivs in strand_intervals["-"].items()}
+
+    operator = SplicedTranslationOperator()
+    candidates = []
+    # Collect '-' strand genes that have zero overlap with any '+' strand gene -> query on '+' strand
+    for chrom, ivs in merged_minus.items():
+        if chrom not in chroms:
+            continue
+        p_ivs = merged_plus.get(chrom, [])
+        for s, e in ivs:
+            if 500 <= (e - s) <= max_len - 1000:
+                has_plus = any(min(e + 400, pe) > max(s - 400, ps) for ps, pe in p_ivs)
+                if not has_plus:
+                    candidates.append((chrom, s, e, "+"))
+
+    # Collect '+' strand genes that have zero overlap with any '-' strand gene -> query on '-' strand (reverse complement)
+    for chrom, ivs in merged_plus.items():
+        if chrom not in chroms:
+            continue
+        m_ivs = merged_minus.get(chrom, [])
+        for s, e in ivs:
+            if 500 <= (e - s) <= max_len - 1000:
+                has_minus = any(min(e + 400, me) > max(s - 400, ms) for ms, me in m_ivs)
+                if not has_minus:
+                    candidates.append((chrom, s, e, "-"))
+
+    rng.shuffle(candidates)
+    samples = []
+    for chrom, s, e, query_strand in candidates:
+        seq = chroms[chrom]
+        w_s = max(0, s - rng.randint(pad_range[0], pad_range[1]))
+        w_e = min(len(seq), e + rng.randint(pad_range[0], pad_range[1]))
+        if w_e - w_s > max_len or w_e - w_s < 800:
+            continue
+        subseq = seq[w_s:w_e]
+        if subseq.upper().count("N") / len(subseq) > 0.05:
+            continue
+        if query_strand == "-":
+            subseq = operator.code.reverse_complement(subseq)
+        samples.append(
+            GenomicGeneSample(
+                dna_sequence=subseq,
+                exon_spans=[],
+                strand="+",
+                gene_id=f"AntisenseNeg_{prefix}_{chrom}_{w_s}_{w_e}",
+                multi_gene_spans=[],
+            )
+        )
+        if len(samples) >= target_count:
+            break
+
+    return samples
 
 
 def extract_pure_negative_windows(
@@ -144,7 +288,7 @@ def extract_pure_negative_windows(
     prefix: str,
     target_count: int,
     min_len: int = 1500,
-    max_len: int = 4000,
+    max_len: int = 5000,
     buffer_bp: int = 500,
     seed: int = 42,
 ) -> List[GenomicGeneSample]:
@@ -205,6 +349,7 @@ def extract_pure_negative_windows(
                     exon_spans=[],
                     strand="+",
                     gene_id=f"Neg_{prefix}_{chrom}_{w_start}_{w_start+w_len}",
+                    multi_gene_spans=[],
                 )
             )
             if len(samples) >= target_count:
@@ -223,12 +368,13 @@ def compile_optimal_training_cohort(
 ) -> List[GenomicGeneSample]:
     """
     Compiles a mathematically scaled 25,000 sample cohort across 5 eukaryotic phyla:
-    - ~65% verified spliced & single-exon protein-coding loci (~16,250 genes)
-    - ~35% authentic non-coding intergenic windows (~8,750 windows) to eliminate intergenic FP leakage.
+    - ~65% verified spliced & single-exon protein-coding windows (with wide random flanking context & multi-gene labeling)
+    - ~20% pure non-coding intergenic windows
+    - ~15% antisense hard-negative windows (real gene on opposite strand, zero coding bases on forward strand)
     """
     print("=" * 70)
     print(f"  COMPILING SCALED {target_total:,d} SAMPLE MULTI-PHYLA TRAINING COHORT")
-    print(f"  Target Composition: {int((1 - negative_ratio) * 100)}% Verified Genes + {int(negative_ratio * 100)}% Pure Intergenic Windows")
+    print(f"  Target Composition: {int((1 - negative_ratio) * 100)}% Multi-Gene Context Windows + {int(negative_ratio * 100)}% Intergenic & Antisense Negatives")
     print("=" * 70)
 
     configs = [
@@ -238,7 +384,8 @@ def compile_optimal_training_cohort(
             "gff": data_dir / "spombe/spombe_genomic.gff",
             "max_multi": 2000,
             "max_single": 500,
-            "max_neg": 250,
+            "max_neg": 150,
+            "max_antisense": 150,
         },
         {
             "prefix": "Celegans",
@@ -246,7 +393,8 @@ def compile_optimal_training_cohort(
             "gff": data_dir / "celegans/celegans_genomic.gff",
             "max_multi": 3000,
             "max_single": 500,
-            "max_neg": 2500,
+            "max_neg": 1500,
+            "max_antisense": 1000,
         },
         {
             "prefix": "Drosophila",
@@ -254,7 +402,8 @@ def compile_optimal_training_cohort(
             "gff": data_dir / "drosophila/drosophila_genomic.gff",
             "max_multi": 3000,
             "max_single": 500,
-            "max_neg": 2000,
+            "max_neg": 1200,
+            "max_antisense": 800,
         },
         {
             "prefix": "Arabidopsis",
@@ -262,7 +411,8 @@ def compile_optimal_training_cohort(
             "gff": data_dir / "arabidopsis/arabidopsis_genomic.gff",
             "max_multi": 3000,
             "max_single": 500,
-            "max_neg": 2500,
+            "max_neg": 1500,
+            "max_antisense": 1000,
         },
         {
             "prefix": "Chlamydomonas",
@@ -270,7 +420,8 @@ def compile_optimal_training_cohort(
             "gff": data_dir / "chlamydomonas/chlamydomonas_genomic.gff",
             "max_multi": 2750,
             "max_single": 500,
-            "max_neg": 1500,
+            "max_neg": 900,
+            "max_antisense": 600,
         },
     ]
 
@@ -278,6 +429,7 @@ def compile_optimal_training_cohort(
     total_multi = 0
     total_single = 0
     total_neg = 0
+    total_antisense = 0
 
     for cfg in configs:
         prefix = cfg["prefix"]
@@ -295,38 +447,51 @@ def compile_optimal_training_cohort(
             prefix=prefix,
             max_multi=cfg["max_multi"],
             max_single=cfg["max_single"],
-            max_len=6000,
+            max_len=10000,
+            random_pad_range=(400, 1800),
             seed=seed,
         )
-        print(f"    -> Extracted {len(multi):4,d} spliced multi-exon + {len(single):4,d} single-exon genes.")
+        print(f"    -> Extracted {len(multi):4,d} spliced multi-exon + {len(single):4,d} single-exon wide-context windows.")
         all_samples.extend(multi)
         all_samples.extend(single)
         total_multi += len(multi)
         total_single += len(single)
 
-        # Extract authentic negative windows
+        # Extract authentic pure intergenic negative windows
         negs = extract_pure_negative_windows(
             gff_path=gff,
             chroms=chroms,
             prefix=prefix,
             target_count=cfg["max_neg"],
             min_len=1500,
-            max_len=4000,
+            max_len=5000,
             buffer_bp=500,
             seed=seed,
         )
-        print(f"    -> Extracted {len(negs):4,d} pure negative intergenic windows.")
+        # Extract hard-negative antisense shadow-ORF windows
+        anti_negs = extract_antisense_negative_windows(
+            gff_path=gff,
+            chroms=chroms,
+            prefix=prefix,
+            target_count=cfg["max_antisense"],
+            seed=seed,
+        )
+        print(f"    -> Extracted {len(negs):4,d} pure intergenic + {len(anti_negs):4,d} antisense shadow-ORF negative windows.")
         all_samples.extend(negs)
+        all_samples.extend(anti_negs)
         total_neg += len(negs)
+        total_antisense += len(anti_negs)
 
     rng = random.Random(seed)
     rng.shuffle(all_samples)
 
     print("\n" + "=" * 70)
-    print(f"[+] Successfully Compiled Scaled 25K Cohort: {len(all_samples):,d} Total Training Samples")
-    print(f"    - Multi-Exon Spliced Genes: {total_multi:,d} ({total_multi/len(all_samples)*100:.1f}%)")
-    print(f"    - Single-Exon Genes:        {total_single:,d} ({total_single/len(all_samples)*100:.1f}%)")
-    print(f"    - Pure Intergenic Negatives: {total_neg:,d} ({total_neg/len(all_samples)*100:.1f}%)")
+    print(f"[+] Successfully Compiled Scaled Cohort: {len(all_samples):,d} Total Training Samples")
+    if all_samples:
+        print(f"    - Multi-Exon Spliced Windows: {total_multi:,d} ({total_multi/len(all_samples)*100:.1f}%)")
+        print(f"    - Single-Exon Windows:        {total_single:,d} ({total_single/len(all_samples)*100:.1f}%)")
+        print(f"    - Pure Intergenic Negatives:  {total_neg:,d} ({total_neg/len(all_samples)*100:.1f}%)")
+        print(f"    - Antisense Shadow Negatives: {total_antisense:,d} ({total_antisense/len(all_samples)*100:.1f}%)")
     print("=" * 70 + "\n")
 
     return all_samples

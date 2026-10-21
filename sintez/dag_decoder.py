@@ -134,6 +134,12 @@ class TopologicalDAGDecoder:
             for f_idx in (0, 1, 2):
                 cumsum_frame[f_idx, 1:] = np.cumsum(phase_p[(idx_arr - f_idx) % 3, idx_arr])
 
+        # Optional neural foldability / coding quality prefix sum (Foundation v3)
+        has_fold = "foldability" in preds and preds["foldability"] is not None
+        cumsum_fold = np.zeros(L + 1, dtype=np.float64)
+        if has_fold:
+            cumsum_fold[1:] = np.cumsum(preds["foldability"])
+
         def get_exon_metrics(s: int, e: int) -> Tuple[float, float]:
             if e <= s:
                 return 0.0, 0.0
@@ -145,6 +151,11 @@ class TopologicalDAGDecoder:
             if not has_phase or e <= s:
                 return 0.0
             return float(cumsum_frame[f_idx, e] - cumsum_frame[f_idx, s]) / (e - s)
+
+        def get_fold_mean(s: int, e: int) -> float:
+            if not has_fold or e <= s:
+                return 0.0
+            return float(cumsum_fold[e] - cumsum_fold[s]) / (e - s)
 
         # 2. Pre-index stop codons by reading frame phase for O(log N) lookup
         stops_set = {"TAA", "TAG", "TGA"}
@@ -214,6 +225,7 @@ class TopologicalDAGDecoder:
                         tot_llr = 0.0
                         tot_p_sum = 0.0
                         tot_frame_p_sum = 0.0
+                        tot_fold_sum = 0.0
                         cur_ph = 0
                         for es, ee in cand_spans:
                             s_llr, s_mp = get_exon_metrics(es, ee)
@@ -223,9 +235,12 @@ class TopologicalDAGDecoder:
                                 f_ex = (es - cur_ph) % 3
                                 tot_frame_p_sum += get_frame_mean(f_ex, es, ee) * (ee - es)
                                 cur_ph = (cur_ph + (ee - es)) % 3
+                            if has_fold:
+                                tot_fold_sum += get_fold_mean(es, ee) * (ee - es)
                         mean_cod = tot_p_sum / max(1, t_len)
                         mean_frame_cod = (tot_frame_p_sum / max(1, t_len)) if has_phase else mean_cod
                         frame_purity = (mean_frame_cod / max(1e-4, mean_cod)) if has_phase else 1.0
+                        mean_fold = (tot_fold_sum / max(1, t_len)) if has_fold else mean_cod
 
                         # Single-exon genes lack splicing signals, requiring stricter coding purity
                         min_cod_req = max(0.48, p0 * 1.7) if is_single_exon else min_cod_th
@@ -237,10 +252,11 @@ class TopologicalDAGDecoder:
                         total_signal = cum_signal + stop_score
                         norm_llr = tot_llr / math.sqrt(max(1, t_len))
                         frame_bonus = (2.5 * mean_frame_cod) if has_phase else 0.0
-                        dna_score = total_signal + norm_llr * 0.5 + mean_cod * 6.0 + frame_bonus + len_evidence
+                        fold_bonus = (2.0 * mean_fold) if has_fold else 0.0
+                        dna_score = total_signal + norm_llr * 0.5 + mean_cod * 6.0 + frame_bonus + fold_bonus + len_evidence
 
                         # Filter candidates with net positive coding evidence, sufficient coding density, and reading-frame coherence
-                        if tot_llr > min_llr_req and mean_cod >= min_cod_req and frame_purity >= 0.25:
+                        if tot_llr > min_llr_req and mean_cod >= min_cod_req and frame_purity >= 0.25 and (not has_fold or mean_fold >= 0.25):
                             completed_for_s.append({
                                 "spans": cand_spans,
                                 "len": t_len,

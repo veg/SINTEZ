@@ -193,3 +193,58 @@ def test_length_bucketing_and_gradient_flow():
     # Ensure gradients flowed to backbone parameters
     has_grad = any(p.grad is not None and torch.any(p.grad != 0.0) for p in backbone.parameters())
     assert has_grad, "Expected gradients to flow to backbone through bucket-padded inputs!"
+
+
+def test_foundation_v3_architecture_and_losses():
+    cfg = DNAEncoderConfig.foundation_v3(
+        hidden_dim=32,
+        dilations=(1, 2, 4, 8),
+        norm_window_sizes=(21, 51),
+        num_span_classes=7,
+    )
+    backbone = CompositionNormalizedBackbone(cfg)
+
+    # Test state_dict config reconstruction round-trip
+    sd = backbone.state_dict()
+    reconstructed_cfg = DNAEncoderConfig.from_state_dict(sd)
+    assert reconstructed_cfg.hidden_dim == 32
+    assert reconstructed_cfg.num_span_classes == 7
+    assert reconstructed_cfg.use_codon_conv is True
+    assert reconstructed_cfg.use_asymmetric_heads is True
+    assert reconstructed_cfg.use_foldability_head is True
+
+    trainer = ContrastiveEnergyTrainer(
+        backbone=backbone,
+        oracle=None,
+        learning_rate=1e-3,
+        loss_type="focal",
+        use_phase_aware_span=True,
+    )
+
+    # Multi-gene window with two co-directional genes
+    g1 = "ATGGCCAAGTTT" + "GTACGTACGTACG" + "AAAGCCGATTGA"  # 0..37
+    spacer = "A" * 23                                      # 37..60
+    g2 = "ATGGCCGATTAA"                                    # 60..72
+    seq = g1 + spacer + g2
+    sample = GenomicGeneSample(
+        dna_sequence=seq,
+        exon_spans=[(0, 12), (25, 37)],
+        strand="+",
+        gene_id="multi_win",
+        multi_gene_spans=[[(0, 12), (25, 37)], [(60, 72)]],
+    )
+    dataset = CounterfactualDataset([sample], bucket_step=32)
+    item = dataset[0]
+
+    # Verify both genes are labeled in target_span and target_foldability
+    assert (item["target_span"][0:12] == 2).all()
+    assert (item["target_span"][60:72] == 2).all()
+    assert (item["target_foldability"][0:12] > 0.5).all()
+    assert (item["target_foldability"][60:72] > 0.5).all()
+    assert (item["target_foldability"][37:60] == 0.0).all()
+
+    metrics = trainer.train_step(item, compute_energy=False)
+    assert metrics["total_loss"] > 0.0
+    assert metrics["loss_phase_trans"] >= 0.0
+    assert metrics["loss_foldability"] > 0.0
+    assert backbone.motif_gate_scale.grad is not None
