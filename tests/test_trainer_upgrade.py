@@ -118,15 +118,24 @@ def test_collate_genomic_batch():
     s2 = GenomicGeneSample("ATGC" * 20, [(0, 24)], "+", "g2")
     dataset = CounterfactualDataset([s1, s2])
 
-    batch = collate_genomic_batch([dataset[0], dataset[1]])
+    batch = collate_genomic_batch([dataset[0], dataset[1]], bucket_step=None)
     assert batch["one_hot_dna"].shape == (2, 4, 80)
     assert batch["target_donor"].shape == (2, 80)
     assert batch["mask"].shape == (2, 80)
     # Sample 1 mask is True for 40, False for 40
     assert batch["mask"][0, :40].all()
     assert not batch["mask"][0, 40:].any()
+    assert (batch["target_span"][0, 40:] == -100).all()
     # Sample 2 mask is True for all 80
     assert batch["mask"][1, :80].all()
+
+    # Bucketed collation (bucket_step=128) -> pads 80 up to 128
+    batch_b = collate_genomic_batch([dataset[0], dataset[1]], bucket_step=128)
+    assert batch_b["one_hot_dna"].shape == (2, 4, 128)
+    assert batch_b["mask"].shape == (2, 128)
+    assert not batch_b["mask"][:, 80:].any()
+    assert (batch_b["target_span_7class"][:, 80:] == -100).all()
+
 
 
 def test_differentiable_contrastive_trainer_gradients():

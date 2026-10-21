@@ -45,9 +45,12 @@ class FocalLoss(nn.Module):
     to mitigate extreme class imbalance (~1:500).
     FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)
 
-    Supports `"pos_norm"` reduction (RetinaNet/FCOS style) which normalizes total focal loss
-    by the number of positive boundary sites (plus a small background floor) rather than sequence
-    length L, preventing gradient dilution on long 15-25 kb windows.
+    Supports:
+    - `mask`: optional float/bool tensor of shape matching `prob` to zero out padded positions
+      without changing tensor shapes (preventing MPSGraph/XLA backward-pass recompilation).
+    - `"pos_norm"` reduction (RetinaNet/FCOS style) which normalizes total focal loss
+      by the number of positive boundary sites (plus a small background floor) rather than sequence
+      length L, preventing gradient dilution on long 15-25 kb windows.
     """
     def __init__(self, alpha: float = 0.75, gamma: float = 2.0, reduction: str = "pos_norm", eps: float = 1e-7):
         super().__init__()
@@ -56,18 +59,34 @@ class FocalLoss(nn.Module):
         self.reduction = reduction
         self.eps = eps
 
-    def forward(self, prob: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        prob: torch.Tensor,
+        target: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         p = torch.clamp(prob, self.eps, 1.0 - self.eps)
-        bce = -(target * torch.log(p) + (1.0 - target) * torch.log(1.0 - p))
-        pt = p * target + (1.0 - p) * (1.0 - target)
-        w = self.alpha * target + (1.0 - self.alpha) * (1.0 - target)
+        t = torch.clamp(target, 0.0, 1.0)
+        bce = -(t * torch.log(p) + (1.0 - t) * torch.log(1.0 - p))
+        pt = p * t + (1.0 - p) * (1.0 - t)
+        w = self.alpha * t + (1.0 - self.alpha) * (1.0 - t)
         focal_weight = w * torch.pow(1.0 - pt, self.gamma)
         loss = focal_weight * bce
+
+        if mask is not None:
+            m = mask.to(loss.dtype)
+            loss = loss * m
+            t_masked = t * m
+        else:
+            t_masked = t
+
         if self.reduction == "pos_norm":
-            # Normalize by positive target mass (with floor of 10.0 so pure-negative windows remain well-scaled)
-            pos_mass = torch.clamp(target.sum(), min=10.0)
+            batch_scale = float(prob.shape[0]) if prob.ndim >= 2 else 1.0
+            pos_mass = torch.clamp(t_masked.sum(), min=10.0 * batch_scale)
             return loss.sum() / (pos_mass * 20.0)
         elif self.reduction == "mean":
+            if mask is not None:
+                return loss.sum() / torch.clamp(mask.to(loss.dtype).sum(), min=1.0)
             return loss.mean()
         elif self.reduction == "sum":
             return loss.sum()
@@ -120,14 +139,12 @@ class CounterfactualDataset(Dataset):
             spliced_dna = "".join(dna_str[s:e] for s, e in spans if 0 <= s < e <= L)
             if len(spliced_dna) < 9:
                 continue
-            # Local 45-bp (15-codon) dinucleotide/codon diversity proxy in [0.65, 1.0]
             for s, e in spans:
                 s_c = max(0, s)
                 e_c = min(L, e)
                 if e_c <= s_c:
                     continue
                 sub = dna_str[s_c:e_c].upper()
-                # Compute base composition entropy in bits (max 2.0 bits)
                 n = len(sub)
                 counts = [sub.count(b) for b in "ACGT"]
                 ent = -sum((c / n) * math.log2(c / n) for c in counts if c > 0)
@@ -177,7 +194,6 @@ class CounterfactualDataset(Dataset):
         for g_spans in all_genes_spans:
             if not g_spans:
                 continue
-            # Mark introns and splice junctions with Gaussian soft-window targets
             for i in range(len(g_spans) - 1):
                 intron_start = g_spans[i][1]
                 intron_end = g_spans[i + 1][0]
@@ -187,7 +203,6 @@ class CounterfactualDataset(Dataset):
                 apply_gaussian_smoothing(target_donor, intron_start, sigma=1.0, radius=2)
                 apply_gaussian_smoothing(target_acceptor, intron_end - 1, sigma=1.0, radius=2)
 
-            # Mark exons and phases
             cum_cds = 0
             for s, e in g_spans:
                 s_c = max(0, s)
@@ -199,13 +214,11 @@ class CounterfactualDataset(Dataset):
                         target_span_7class[pos] = 2 + phase
                     cum_cds += 1
 
-            # Mark start and stop codons with Gaussian soft-window targets
             s_first = g_spans[0][0]
             e_last = g_spans[-1][1]
             apply_gaussian_smoothing(target_start, s_first, sigma=1.0, radius=2)
             apply_gaussian_smoothing(target_stop, e_last - 3, sigma=1.0, radius=2)
 
-            # 7-class start/stop regions
             if 0 <= s_first and s_first + 3 <= L:
                 target_span_7class[s_first : s_first + 3] = 5
             if 0 <= e_last - 3 and e_last <= L:
@@ -240,20 +253,29 @@ class CounterfactualDataset(Dataset):
         }
 
 
-def collate_genomic_batch(batch: List[Dict]) -> Dict:
-    """Collates variable-length genomic samples into a padded batch for GPU/MPS."""
-    max_len = max(b["target_span"].shape[0] for b in batch)
+def collate_genomic_batch(batch: List[Dict], bucket_step: Optional[int] = 256) -> Dict:
+    """
+    Collates variable-length genomic samples into a static-bucket padded batch `(B, ..., max_len)`
+    for GPU/MPS/TPU execution. Pads `target_span` and `target_span_7class` with `-100`
+    (`ignore_index=-100`) and populates `mask` of shape `(B, max_len)` so both forward and
+    backward passes execute strictly on bucket-aligned tensor shapes without dynamic slicing.
+    """
+    raw_max = max(b["one_hot_dna"].shape[-1] for b in batch)
+    if bucket_step is not None and bucket_step > 0:
+        rem = raw_max % bucket_step
+        max_len = raw_max + ((bucket_step - rem) if rem != 0 else 0)
+    else:
+        max_len = raw_max
+
     B = len(batch)
 
-    padded_one_hot = torch.zeros(B, 4, max_len, dtype=torch.float32)
-    padded_one_hot[:, :, :] = 0.25  # Uniform background for padding
-
+    padded_one_hot = torch.full((B, 4, max_len), 0.25, dtype=torch.float32)
     padded_donor = torch.zeros(B, max_len, dtype=torch.float32)
     padded_acceptor = torch.zeros(B, max_len, dtype=torch.float32)
     padded_start = torch.zeros(B, max_len, dtype=torch.float32)
     padded_stop = torch.zeros(B, max_len, dtype=torch.float32)
-    padded_span = torch.zeros(B, max_len, dtype=torch.long)
-    padded_span_7class = torch.zeros(B, max_len, dtype=torch.long)
+    padded_span = torch.full((B, max_len), -100, dtype=torch.long)
+    padded_span_7class = torch.full((B, max_len), -100, dtype=torch.long)
     padded_foldability = torch.zeros(B, max_len, dtype=torch.float32)
     mask = torch.zeros(B, max_len, dtype=torch.bool)
 
@@ -282,6 +304,43 @@ def collate_genomic_batch(batch: List[Dict]) -> Dict:
         "mask": mask,
         "samples": batch,
     }
+
+
+class BucketBatchSampler:
+    """
+    Groups dataset indices of similar sequence lengths into mini-batches of size `batch_size`
+    with minimal padding overhead, then shuffles the mini-batches each epoch.
+    """
+    def __init__(self, lengths: List[int], batch_size: int = 16, shuffle: bool = True, seed: int = 42):
+        self.lengths = lengths
+        self.batch_size = max(1, batch_size)
+        self.shuffle = shuffle
+        self.seed = seed
+        self.epoch = 0
+
+    def __len__(self) -> int:
+        return (len(self.lengths) + self.batch_size - 1) // self.batch_size
+
+    def __iter__(self):
+        import random
+        rng = random.Random(self.seed + self.epoch)
+        self.epoch += 1
+
+        # Add small jitter to lengths before sorting so batches diversify across epochs while staying within ~1 bucket
+        indices = list(range(len(self.lengths)))
+        if self.shuffle:
+            indices.sort(key=lambda i: self.lengths[i] + rng.randint(-128, 128))
+        else:
+            indices.sort(key=lambda i: self.lengths[i])
+
+        batches = [
+            indices[i : i + self.batch_size]
+            for i in range(0, len(indices), self.batch_size)
+        ]
+        if self.shuffle:
+            rng.shuffle(batches)
+        for b in batches:
+            yield b
 
 
 class ContrastiveEnergyTrainer:
@@ -326,48 +385,44 @@ class ContrastiveEnergyTrainer:
         else:
             self.junc_loss_fn = nn.BCELoss()
 
-        # Class-weighted CrossEntropy for 7-class mode:
+        # Class-weighted CrossEntropy for 7-class mode with ignore_index=-100 for bucket padding:
         # 0: Intergenic (1.0), 1: Intron (1.4), 2-4: Exon Phase 0/1/2 (1.8), 5: Start (6.0), 6: Stop (6.0)
         device = next(self.backbone.parameters()).device
         if use_phase_aware_span:
             weights_7 = torch.tensor([1.0, 1.4, 1.8, 1.8, 1.8, 6.0, 6.0], dtype=torch.float32, device=device)
-            self.span_loss_fn = nn.CrossEntropyLoss(weight=weights_7)
+            self.span_loss_fn = nn.CrossEntropyLoss(weight=weights_7, ignore_index=-100)
         else:
-            self.span_loss_fn = nn.CrossEntropyLoss()
+            self.span_loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
 
     @staticmethod
     def compute_phase_transition_loss(span_probs_raw: torch.Tensor, target_span_7class: torch.Tensor) -> torch.Tensor:
         """
-        Penalizes illegal reading-frame transitions inside interior coding exons:
-        Whenever both pos t and pos t+1 are interior coding bases (target in {2, 3, 4}),
-        the predicted probability distribution at t+1 must equal the cyclic shift of pos t:
-          P(Phase 1 at t+1) ~= P(Phase 0 at t)
-          P(Phase 2 at t+1) ~= P(Phase 1 at t)
-          P(Phase 0 at t+1) ~= P(Phase 2 at t)
+        Static-shape, boolean-indexing-free phase-transition consistency loss across `(B, 7, L)`
+        or `(1, 7, L)` tensors. Penalizes illegal reading-frame transitions inside interior
+        coding exons (`target in {2, 3, 4}`) using pure float mask multiplication so MPSGraph/XLA
+        never recompiles on dynamic boolean masks.
         """
         if span_probs_raw.shape[1] < 7 or span_probs_raw.shape[-1] < 2:
             return torch.tensor(0.0, device=span_probs_raw.device)
 
-        # Interior exon mask where both t and t+1 are in {2, 3, 4} and follow (t+1)_phase == (t_phase + 1) % 3
-        t_cur = target_span_7class[:-1]
-        t_nxt = target_span_7class[1:]
-        valid_interior = (t_cur >= 2) & (t_cur <= 4) & (t_nxt >= 2) & (t_nxt <= 4)
-        if not torch.any(valid_interior):
-            return torch.tensor(0.0, device=span_probs_raw.device)
+        if target_span_7class.ndim == 1:
+            t_7 = target_span_7class.unsqueeze(0)
+        else:
+            t_7 = target_span_7class
 
-        # Extract phase channels (2: Phase 0, 3: Phase 1, 4: Phase 2) -> shape (3, L)
-        p_phase = span_probs_raw.squeeze(0)[2:5, :]
-        p_t = p_phase[:, :-1]  # [P0(t), P1(t), P2(t)]
-        # Expected at t+1 is cyclic shift: [P2(t), P0(t), P1(t)] -> wait:
-        # If pos t is Phase 0, pos t+1 is Phase 1!
-        # So P_expected(Phase 1 at t+1) = P(Phase 0 at t),
-        #    P_expected(Phase 2 at t+1) = P(Phase 1 at t),
-        #    P_expected(Phase 0 at t+1) = P(Phase 2 at t).
-        p_expected_nxt = torch.stack([p_t[2], p_t[0], p_t[1]], dim=0)
-        p_actual_nxt = p_phase[:, 1:]
+        t_cur = t_7[:, :-1]
+        t_nxt = t_7[:, 1:]
+        valid_mask = ((t_cur >= 2) & (t_cur <= 4) & (t_nxt >= 2) & (t_nxt <= 4)).to(span_probs_raw.dtype)
 
-        diff = torch.abs(p_actual_nxt - p_expected_nxt).mean(dim=0)
-        return diff[valid_interior].mean()
+        # Extract phase channels (2: Phase 0, 3: Phase 1, 4: Phase 2) -> shape (B, 3, L)
+        p_phase = span_probs_raw[:, 2:5, :]
+        p_t = p_phase[:, :, :-1]  # (B, 3, L-1)
+        # Cyclic shift: P_expected(Phase 0, 1, 2 at t+1) = [P(Phase 2 at t), P(Phase 0 at t), P(Phase 1 at t)]
+        p_expected_nxt = torch.stack([p_t[:, 2, :], p_t[:, 0, :], p_t[:, 1, :]], dim=1)
+        p_actual_nxt = p_phase[:, :, 1:]
+
+        diff = torch.abs(p_actual_nxt - p_expected_nxt).mean(dim=1)  # (B, L-1)
+        return (diff * valid_mask).sum() / torch.clamp(valid_mask.sum(), min=1.0)
 
     def compute_transcript_log_prob(
         self,
@@ -386,17 +441,14 @@ class ContrastiveEnergyTrainer:
         device = preds["donor_prob"].device
         log_prob = torch.tensor(0.0, device=device)
 
-        # 1. Start codon
         s0 = spans[0][0]
         if 0 <= s0 < L:
             log_prob = log_prob + torch.log(preds["start_prob"].squeeze()[s0] + eps)
 
-        # 2. Stop codon
         e_last = spans[-1][1]
         if 0 <= e_last - 3 < L:
             log_prob = log_prob + torch.log(preds["stop_prob"].squeeze()[e_last - 3] + eps)
 
-        # 3. Splice junctions
         for i in range(len(spans) - 1):
             donor_pos = spans[i][1]
             acceptor_pos = spans[i+1][0] - 1
@@ -405,19 +457,110 @@ class ContrastiveEnergyTrainer:
             if 0 <= acceptor_pos < L:
                 log_prob = log_prob + torch.log(preds["acceptor_prob"].squeeze()[acceptor_pos] + eps)
 
-        # 4. Exon span coding probability
         exon_indices = []
         for s, e in spans:
             exon_indices.extend(range(max(0, s), min(L, e)))
 
         if exon_indices:
             idx_tensor = torch.tensor(exon_indices, dtype=torch.long, device=device)
-            # Class 2 is Exon (or sum of Phase 0, 1, 2 in 7-class mode)
             exon_probs = preds["span_probs"].squeeze(0)[2, idx_tensor]
             mean_exon_log_prob = torch.log(exon_probs + eps).mean()
             log_prob = log_prob + mean_exon_log_prob
 
         return log_prob
+
+    def train_batch_step(
+        self,
+        collated_batch: Dict,
+        accum_steps: int = 1,
+        step_optimizer: bool = True,
+        zero_grad: bool = True,
+    ) -> Dict[str, float]:
+        """
+        Executes a true batched `(B, 4, L_bucket)` forward and backward pass where both
+        inputs and targets are padded to static bucket multiples (`L_bucket`), completely
+        eliminating per-sample MPSGraph/XLA backward-pass recompilation.
+        """
+        self.backbone.train()
+        if zero_grad:
+            self.optimizer.zero_grad()
+
+        device = next(self.backbone.parameters()).device
+        one_hot = collated_batch["one_hot_dna"].to(device)      # (B, 4, L_bucket)
+        mask = collated_batch["mask"].to(device)                # (B, L_bucket)
+        t_donor = collated_batch["target_donor"].to(device)     # (B, L_bucket)
+        t_acceptor = collated_batch["target_acceptor"].to(device)
+        t_start = collated_batch["target_start"].to(device)
+        t_stop = collated_batch["target_stop"].to(device)
+
+        if self.use_phase_aware_span and "target_span_7class" in collated_batch:
+            t_span = collated_batch["target_span_7class"].to(device)  # (B, L_bucket) with -100 on pad
+        else:
+            t_span = collated_batch["target_span"].to(device)
+
+        # 1. Batched Forward Pass on Bucketed Tensor Shape (B, 4, L_bucket)
+        preds = self.backbone(one_hot)
+
+        # 2. Masked Junction Boundary Losses (no tensor slicing)
+        if isinstance(self.junc_loss_fn, FocalLoss):
+            loss_donor = self.junc_loss_fn(preds["donor_prob"], t_donor, mask=mask)
+            loss_acceptor = self.junc_loss_fn(preds["acceptor_prob"], t_acceptor, mask=mask)
+            loss_start = self.junc_loss_fn(preds["start_prob"], t_start, mask=mask)
+            loss_stop = self.junc_loss_fn(preds["stop_prob"], t_stop, mask=mask)
+        else:
+            m_f = mask.to(one_hot.dtype)
+            denom = torch.clamp(m_f.sum(), min=1.0)
+            loss_donor = (F.binary_cross_entropy(preds["donor_prob"], t_donor, reduction="none") * m_f).sum() / denom
+            loss_acceptor = (F.binary_cross_entropy(preds["acceptor_prob"], t_acceptor, reduction="none") * m_f).sum() / denom
+            loss_start = (F.binary_cross_entropy(preds["start_prob"], t_start, reduction="none") * m_f).sum() / denom
+            loss_stop = (F.binary_cross_entropy(preds["stop_prob"], t_stop, reduction="none") * m_f).sum() / denom
+        loss_junctions = loss_donor + loss_acceptor + loss_start + loss_stop
+
+        # 3. Masked Span Segmentation Loss (ignore_index=-100) + Static-Shape Phase Transition Loss
+        loss_phase_trans = torch.tensor(0.0, device=device)
+        if self.use_phase_aware_span and "span_probs_raw" in preds:
+            if self.span_loss_fn.weight is not None and self.span_loss_fn.weight.device != device:
+                self.span_loss_fn.weight = self.span_loss_fn.weight.to(device)
+            loss_span = self.span_loss_fn(preds["span_logits"], t_span)
+            loss_phase_trans = self.compute_phase_transition_loss(preds["span_probs_raw"], t_span)
+        else:
+            loss_span = self.span_loss_fn(preds["span_probs"], t_span)
+
+        # 4. Masked Auxiliary Neural Foldability Distillation Loss
+        loss_foldability = torch.tensor(0.0, device=device)
+        if "foldability_prob" in preds and "target_foldability" in collated_batch:
+            t_fold = collated_batch["target_foldability"].to(device)
+            m_f = mask.to(one_hot.dtype)
+            raw_fold = F.smooth_l1_loss(preds["foldability_prob"], t_fold, reduction="none")
+            loss_foldability = (raw_fold * m_f).sum() / torch.clamp(m_f.sum(), min=1.0)
+
+        # 5. Composite Objective
+        total_loss = (
+            self.lambda_junc * loss_junctions
+            + self.lambda_span * loss_span
+            + self.lambda_phase_trans * loss_phase_trans
+            + self.lambda_foldability * loss_foldability
+        )
+
+        loss_to_backprop = total_loss / max(1, accum_steps)
+        loss_to_backprop.backward()
+
+        if step_optimizer:
+            torch.nn.utils.clip_grad_norm_(self.backbone.parameters(), max_norm=1.0)
+            self.optimizer.step()
+            if not zero_grad:
+                self.optimizer.zero_grad()
+
+        return {
+            "total_loss": total_loss.item(),
+            "loss_junctions": loss_junctions.item(),
+            "loss_span": loss_span.item(),
+            "loss_phase_trans": loss_phase_trans.item(),
+            "loss_foldability": loss_foldability.item(),
+            "contrastive_loss": 0.0,
+            "e_pos": 0.0,
+            "is_true_valid": True,
+        }
 
     def train_step(
         self,
@@ -427,7 +570,30 @@ class ContrastiveEnergyTrainer:
         step_optimizer: bool = True,
         zero_grad: bool = True,
     ) -> Dict[str, float]:
-        """Executes a single contrastive optimization step on one sample."""
+        """
+        Executes a single optimization step on either a collated mini-batch (`one_hot_dna` is 3D `(B, 4, L)`)
+        or a single sample (`one_hot_dna` is 2D `(4, L)`). When `compute_energy=False`, routes through
+        `train_batch_step` so targets are bucket-padded to `one_hot_dna.shape[-1]` without dynamic slicing.
+        """
+        if batch["one_hot_dna"].ndim == 3 and not compute_energy:
+            return self.train_batch_step(
+                batch,
+                accum_steps=accum_steps,
+                step_optimizer=step_optimizer,
+                zero_grad=zero_grad,
+            )
+
+        if not compute_energy:
+            # Pad single sample targets to match bucketed one_hot_dna length so backward pass uses static bucket shape
+            L_bucket = batch["one_hot_dna"].shape[-1]
+            collated = collate_genomic_batch([batch], bucket_step=L_bucket)
+            return self.train_batch_step(
+                collated,
+                accum_steps=accum_steps,
+                step_optimizer=step_optimizer,
+                zero_grad=zero_grad,
+            )
+
         self.backbone.train()
         if zero_grad:
             self.optimizer.zero_grad()
@@ -446,7 +612,6 @@ class ContrastiveEnergyTrainer:
         else:
             t_span = batch["target_span"].to(device)
 
-        # 1. Forward Pass
         preds = self.backbone(one_hot)
         L = one_hot.shape[-1]
         valid_len = batch.get("valid_len", L)
@@ -458,14 +623,12 @@ class ContrastiveEnergyTrainer:
             }
             L = valid_len
 
-        # 2. Junction Boundary Losses (Positive-count-normalized Focal or BCE)
         loss_donor = self.junc_loss_fn(preds["donor_prob"].squeeze(), t_donor)
         loss_acceptor = self.junc_loss_fn(preds["acceptor_prob"].squeeze(), t_acceptor)
         loss_start = self.junc_loss_fn(preds["start_prob"].squeeze(), t_start)
         loss_stop = self.junc_loss_fn(preds["stop_prob"].squeeze(), t_stop)
         loss_junctions = loss_donor + loss_acceptor + loss_start + loss_stop
 
-        # 3. Span Segmentation Loss + Reading-Frame Phase Transition Consistency Loss
         loss_phase_trans = torch.tensor(0.0, device=device)
         if self.use_phase_aware_span and "span_probs_raw" in preds:
             if self.span_loss_fn.weight is not None and self.span_loss_fn.weight.device != device:
@@ -475,13 +638,11 @@ class ContrastiveEnergyTrainer:
         else:
             loss_span = self.span_loss_fn(preds["span_probs"].squeeze(0).permute(1, 0), t_span)
 
-        # 4. Auxiliary Neural Foldability / Coding Quality Distillation Loss
         loss_foldability = torch.tensor(0.0, device=device)
         if "foldability_prob" in preds and "target_foldability" in batch:
             t_fold = batch["target_foldability"].to(device)
             loss_foldability = F.smooth_l1_loss(preds["foldability_prob"].squeeze(), t_fold)
 
-        # 5. Differentiable Dual-Space Path-Ranking Loss with Oracle Energy Margin
         contrastive_loss = torch.tensor(0.0, device=device)
         contrastive_cost = 0.0
         e_pos = 0.0
@@ -493,7 +654,6 @@ class ContrastiveEnergyTrainer:
             e_pos = e_pos_dict["total_energy"]
             is_valid = e_pos_dict["is_valid_orf"]
 
-            # Differentiable positive path score from backbone
             score_pos = self.compute_transcript_log_prob(preds, true_tx.exon_spans, L)
 
             negatives = batch.get("negatives")
@@ -504,14 +664,8 @@ class ContrastiveEnergyTrainer:
             for neg_name, neg_tx in negatives:
                 e_neg_dict = self.oracle.score_sequence(neg_tx.protein_sequence)
                 e_neg = e_neg_dict["total_energy"]
-
-                # Energy margin: larger foldability discrepancy demands larger score gap
                 energy_margin = max(self.margin, (e_pos - e_neg) + self.margin)
-
-                # Differentiable negative path score from backbone
                 score_neg = self.compute_transcript_log_prob(preds, neg_tx.exon_spans, L)
-
-                # Ranking hinge loss: score_neg should be less than score_pos - energy_margin
                 violation = F.relu(score_neg - score_pos + energy_margin)
                 ranking_losses.append(violation)
 
@@ -519,7 +673,6 @@ class ContrastiveEnergyTrainer:
                 contrastive_loss = torch.stack(ranking_losses).mean()
                 contrastive_cost = contrastive_loss.item()
 
-        # 6. Composite Objective (Fully Differentiable)
         total_loss = (
             self.lambda_junc * loss_junctions
             + self.lambda_span * loss_span
