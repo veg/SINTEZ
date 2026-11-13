@@ -26,6 +26,21 @@ from .trainer import GenomicGeneSample
 from .translation_operator import SplicedTranslationOperator
 
 
+BENCHMARK_HOLDOUT_CHROMS = frozenset({
+    "NC_006980.1",  # cparvum
+    "NC_004329.3",  # pfalciparum
+    "NC_031232.1",  # tgondii
+    "NC_004353.4",  # dmel
+    "NC_037280.1",  # pfalciparum_chr2
+    "NC_001134.8",  # scerevisiae
+    "NC_003421.2",  # spombe
+    "NC_003279.8",  # celegans
+    "NC_003070.9",  # athaliana
+    "NC_057004.1",  # creinhardtii
+})
+BENCHMARK_HOLDOUT_STEMS = frozenset(c.split(".")[0] for c in BENCHMARK_HOLDOUT_CHROMS)
+
+
 def load_fasta_chroms(fasta_path: Path) -> Dict[str, str]:
     """Loads all chromosomes/scaffolds from a FASTA file into memory."""
     chroms = {}
@@ -365,6 +380,7 @@ def compile_optimal_training_cohort(
     target_total: int = 25000,
     negative_ratio: float = 0.35,
     seed: int = 42,
+    exclude_benchmark_chroms: bool = True,
 ) -> List[GenomicGeneSample]:
     """
     Compiles a mathematically scaled 25,000 sample cohort across 5 eukaryotic phyla:
@@ -441,6 +457,15 @@ def compile_optimal_training_cohort(
 
         print(f"[*] Parsing {prefix:14s} ({fna.name})...")
         chroms = load_fasta_chroms(fna)
+        if exclude_benchmark_chroms:
+            orig_n = len(chroms)
+            chroms = {
+                k: v for k, v in chroms.items()
+                if k not in BENCHMARK_HOLDOUT_CHROMS and k.split(".")[0] not in BENCHMARK_HOLDOUT_STEMS
+            }
+            excluded_n = orig_n - len(chroms)
+            if excluded_n > 0:
+                print(f"    [Holdout] Excluded {excluded_n} benchmark chromosome(s) from {prefix} training pool.")
         multi, single = parse_gff_transcripts(
             gff_path=gff,
             chroms=chroms,

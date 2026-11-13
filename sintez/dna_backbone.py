@@ -29,6 +29,7 @@ class DNAEncoderConfig:
     use_codon_conv: bool = False    # Foundation v3: parallel dilation=3 codon-periodic residual branch
     use_asymmetric_heads: bool = False  # Foundation v3: asymmetric boundary-difference splice/codon heads + dinuc gates
     use_foldability_head: bool = False  # Foundation v3: auxiliary neural foldability / coding quality distillation head
+    sharp_motif_gate: bool = False      # Foundation v3.1: 3-bp center-peaked motif gate (no +/-2 bleed)
 
     @classmethod
     def classic_v1(cls, hidden_dim: int = 64, norm_window_size: int = 201) -> DNAEncoderConfig:
@@ -131,6 +132,7 @@ class DNAEncoderConfig:
         use_codon_conv = any("conv_codon" in k for k in state_dict.keys())
         use_asymmetric_heads = any("head_donor.proj" in k for k in state_dict.keys())
         use_foldability_head = any(k.startswith("head_foldability.") for k in state_dict.keys())
+        sharp_motif_gate = "_sharp_motif_gate" in state_dict
 
         return cls(
             in_channels=4,
@@ -145,6 +147,7 @@ class DNAEncoderConfig:
             use_codon_conv=use_codon_conv,
             use_asymmetric_heads=use_asymmetric_heads,
             use_foldability_head=use_foldability_head,
+            sharp_motif_gate=sharp_motif_gate,
         )
 
 
@@ -374,15 +377,21 @@ class CompositionNormalizedBackbone(nn.Module):
         else:
             self.head_foldability = None
 
+        if self.cfg.sharp_motif_gate:
+            self.register_buffer("_sharp_motif_gate", torch.tensor(1, dtype=torch.uint8))
+
     @staticmethod
-    def _compute_canonical_motif_indicators(one_hot_dna: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _compute_canonical_motif_indicators(
+        one_hot_dna: torch.Tensor,
+        sharp: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Computes smooth local indicators (pooled over +/-2 bp radius to match Gaussian target smoothing)
-        for canonical splice and translation boundary motifs:
+        Computes smooth local indicators around canonical splice and translation boundary motifs:
           - Donor: GT or GC at (pos, pos+1)
           - Acceptor: AG at (pos-1, pos)
           - Start: ATG/GTG/TTG at (pos, pos+1, pos+2)
           - Stop: TAA/TAG/TGA at (pos, pos+1, pos+2)
+        When `sharp=True` (v3.1), peaks at exact canonical sites (1.0) with 0.25 at +/-1 bp and 0.0 at +/-2 bp.
         """
         # Channels: 0=A, 1=C, 2=G, 3=T
         A = one_hot_dna[:, 0, :]
@@ -405,11 +414,15 @@ class CompositionNormalizedBackbone(nn.Module):
         is_start = torch.clamp(A + 0.3 * G + 0.3 * T, 0.0, 1.0) * T_next * G_next2
         is_stop = T * torch.clamp(A_next * A_next2 + A_next * G_next2 + G_next * A_next2, 0.0, 1.0)
 
-        # Max-pool over a 5-bp window (radius=2) so Gaussian target neighbors around canonical sites remain unpenalized
-        def pool5(t: torch.Tensor) -> torch.Tensor:
-            return F.max_pool1d(F.pad(t.unsqueeze(1), (2, 2), mode="replicate"), kernel_size=5, stride=1).squeeze(1)
+        if sharp:
+            def pool_fn(t: torch.Tensor) -> torch.Tensor:
+                p3 = F.max_pool1d(F.pad(t.unsqueeze(1), (1, 1), mode="replicate"), kernel_size=3, stride=1).squeeze(1)
+                return torch.maximum(t, 0.25 * p3)
+        else:
+            def pool_fn(t: torch.Tensor) -> torch.Tensor:
+                return F.max_pool1d(F.pad(t.unsqueeze(1), (2, 2), mode="replicate"), kernel_size=5, stride=1).squeeze(1)
 
-        return pool5(is_donor), pool5(is_accept), pool5(is_start), pool5(is_stop)
+        return pool_fn(is_donor), pool_fn(is_accept), pool_fn(is_start), pool_fn(is_stop)
 
     def forward(self, one_hot_dna: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
@@ -450,7 +463,10 @@ class CompositionNormalizedBackbone(nn.Module):
             start_logits = self.head_start(x_ctx, one_hot_dna)
             stop_logits = self.head_stop(x_ctx, one_hot_dna)
 
-            m_don, m_acc, m_sta, m_sto = self._compute_canonical_motif_indicators(one_hot_dna)
+            m_don, m_acc, m_sta, m_sto = self._compute_canonical_motif_indicators(
+                one_hot_dna,
+                sharp=self.cfg.sharp_motif_gate,
+            )
             scales = torch.clamp(self.motif_gate_scale, 0.0, 6.0)
             # Centered residual gate: (m - 0.5) is +0.5 near canonical motifs and -0.5 elsewhere
             donor_logits = donor_logits + scales[0] * (m_don - 0.5)

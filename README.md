@@ -101,25 +101,25 @@ Where:
 
 All benchmark results reported below are authentic, computational executions evaluated against **NCBI RefSeq ground truth** annotations without synthetic placeholders or calibration cheats.
 
-### Multi-Phyla Foundation v3 (SWA / Epoch 3, 10 Chromosomes across 9 Eukaryotic Organisms)
+### Multi-Phyla Foundation v3 + Calibrated DAG Decoder (10 Chromosomes across 9 Eukaryotic Organisms)
 Evaluated across **10,187,568 bp** (`2,380` ground-truth CDS genes, `8,015` ground-truth exons) spanning Fungi, Apicomplexan parasites, Plants, Green Algae, Nematodes, and Insects:
 
 | Target Chromosome | Taxon / Kingdom | Size (bp) | GT Genes | GT Exons | Base MCC | Base Sn | Base PPV | Base F1 | Exact Exons | Relaxed Exon Sp | Exact Genes |
 | :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| **S. pombe Chr III (1 Mb)** (`NC_003421.2`) | Fungi (Fission Yeast) | 1,000,000 | 383 | 786 | **+0.9331** | 95.36% | 96.32% | **95.84%** | 458 (58.27%) | **88.07%** | **235 / 383** (61.36%) |
-| **S. cerevisiae Chr II** (`NC_001134.8`) | Fungi (Budding Yeast) | 813,184 | 412 | 446 | **+0.9255** | 96.26% | 98.54% | **97.39%** | 301 (67.49%) | **83.22%** | **288 / 412** (69.90%) |
-| **P. falciparum Chr 5** (`NC_004326.2`) | Apicomplexa (80.7% AT) | 1,343,557 | 310 | 853 | **+0.9025** | 94.34% | 94.55% | **94.45%** | 448 (52.52%) | **79.35%** | **170 / 310** (54.84%) |
-| **C. parvum Chr 1** (`NC_006986.2`) | Apicomplexa (69.9% AT) | 875,659 | 385 | 464 | **+0.9160** | 98.18% | 97.69% | **97.94%** | 269 (57.97%) | **73.32%** | **238 / 385** (61.82%) |
-| **A. thaliana Chr 1 (500 kb)** (`NC_003070.9`) | Plantae (Dicot) | 500,001 | 159 | 984 | **+0.8802** | 92.34% | 94.66% | **93.49%** | 589 (59.86%) | **90.81%** | **61 / 159** (38.36%) |
-| **P. falciparum Chr 2** (`NC_000910.2`) | Apicomplexa (80.2% AT) | 947,102 | 214 | 558 | **+0.8755** | 91.50% | 94.64% | **93.04%** | 290 (51.97%) | **79.72%** | **117 / 214** (54.67%) |
-| **C. reinhardtii Chr 1 (1 Mb)** (`NC_057004.1`) | Chlorophyta (64% GC) | 1,000,000 | 132 | 1,429 | **+0.8602** | 84.33% | 94.40% | **89.08%** | 880 (61.58%) | **92.47%** | **18 / 132** (13.64%) |
-| **D. melanogaster Chr 4** (`NC_004353.4`) | Metazoa (Insect) | 1,348,131 | 80 | 760 | **+0.8483** | 88.88% | 85.49% | **87.15%** | 470 (61.84%) | **61.10%** | **21 / 80** (26.25%) |
-| **C. elegans Chr I (500 kb)** (`NC_003279.8`) | Metazoa (Nematode) | 500,001 | 63 | 496 | **+0.8327** | 87.35% | 88.35% | **87.85%** | 267 (53.83%) | **81.86%** | **19 / 63** (30.16%) |
-| **T. gondii Chr Ia** (`NC_031467.1`) | Apicomplexa (Zero-Shot) | 1,859,933 | 242 | 1,239 | **+0.7639** | 80.70% | 81.97% | **81.33%** | 380 (30.67%) | **54.17%** | **40 / 242** (16.53%) |
-| **10-Chromosome Aggregate / Mean** | **9 Organisms** | **10,187,568** | **2,380** | **8,015** | **+0.8500** | **89.91%** | **92.19%** | **90.27%** | **4,303** (53.69%) | **75.20%** | **1,186 / 2,380** (49.83%) |
+| **S. cerevisiae Chr II** (`NC_001134.8`) | Fungi (Budding Yeast) | 813,184 | 412 | 446 | **+0.9384** | 97.96% | 98.82% | **98.39%** | 336 (75.34%) | **88.33%** | **324 / 412** (78.64%) |
+| **S. pombe Chr III (1 Mb)** (`NC_003421.2`) | Fungi (Fission Yeast) | 1,000,000 | 383 | 786 | **+0.9270** | 95.85% | 97.02% | **96.43%** | 542 (68.96%) | **82.14%** | **256 / 383** (66.84%) |
+| **C. parvum Chr 1** (`NC_006986.2`) | Apicomplexa (69.9% AT) | 875,659 | 385 | 417 | **+0.9167** | 99.18% | 96.83% | **97.99%** | 283 (67.87%) | **74.54%** | **256 / 385** (66.49%) |
+| **C. reinhardtii Chr 1 (1 Mb)** (`NC_057004.1`) | Chlorophyta (64% GC) | 1,000,000 | 132 | 1,429 | **+0.9135** | 93.37% | 95.05% | **94.20%** | 1,114 (77.96%) | **92.32%** | **53 / 132** (40.15%) |
+| **P. falciparum Chr 5** (`NC_004326.2`) | Apicomplexa (80.7% AT) | 1,343,557 | 310 | 768 | **+0.9082** | 94.15% | 97.18% | **95.64%** | 349 (45.44%) | **89.51%** | **181 / 310** (58.39%) |
+| **A. thaliana Chr 1 (500 kb)** (`NC_003070.9`) | Plantae (Dicot) | 500,001 | 159 | 984 | **+0.8960** | 93.21% | 94.29% | **93.74%** | 612 (62.20%) | **88.90%** | **69 / 159** (43.40%) |
+| **P. falciparum Chr 2** (`NC_000910.2`) | Apicomplexa (80.2% AT) | 947,102 | 214 | 558 | **+0.8754** | 92.22% | 94.67% | **93.43%** | 292 (52.33%) | **82.55%** | **124 / 214** (57.94%) |
+| **C. elegans Chr I (500 kb)** (`NC_003279.8`) | Metazoa (Nematode) | 500,001 | 63 | 496 | **+0.8153** | 91.22% | 79.00% | **84.67%** | 290 (58.47%) | **72.14%** | **18 / 63** (28.57%) |
+| **T. gondii Chr Ia** (`NC_031467.1`) | Apicomplexa (Zero-Shot) | 1,859,933 | 242 | 1,371 | **+0.7902** | 85.12% | 87.14% | **86.12%** | 614 (44.78%) | **63.60%** | **41 / 242** (16.94%) |
+| **D. melanogaster Chr 4** (`NC_004353.4`) | Metazoa (Insect) | 1,348,131 | 80 | 760 | **+0.7669** | 94.14% | 71.01% | **80.96%** | 455 (59.87%) | **59.61%** | **23 / 80** (28.75%) |
+| **10-Chromosome Aggregate / Mean** | **9 Organisms** | **10,187,568** | **2,380** | **8,015** | **+0.8747** | **93.64%** | **91.10%** | **92.16%** | **4,887** (60.97%) | **79.36%** | **1,345 / 2,380** (56.51%) |
 
 > [!NOTE]
-> Across `10.19 Mb` of eukaryotic chromosomes spanning `19.3% GC` (*P. falciparum*) to `64.1% GC` (*C. reinhardtii*), SINTEZ Foundation v3 achieves **+0.8500 Mean Base MCC**, **90.27% Mean Base F1**, and reconstructs **1,186 / 2,380 (49.83%) complete genes with 100% exact start, splice, and stop coordinates**.
+> Across `10.19 Mb` of eukaryotic chromosomes spanning `19.3% GC` (*P. falciparum*) to `64.1% GC` (*C. reinhardtii*), SINTEZ Foundation v3 (`2,274,320` trainable parameters + frozen `8M` ESM-2 oracle) achieves **+0.8747 Mean Base MCC**, **92.16% Mean Base F1**, and reconstructs **1,345 / 2,380 (56.51%) complete genes with 100% exact start, splice, and stop coordinates**.
 
 ---
 

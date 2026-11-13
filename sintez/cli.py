@@ -166,7 +166,8 @@ def cmd_predict(args):
     backbone.load_state_dict(state_dict)
     backbone.eval()
 
-    oracle = ProteinEnergyOracle(device=device)
+    oracle_dev = "cpu" if device.type == "mps" else str(device)
+    oracle = ProteinEnergyOracle(device=oracle_dev)
     decoder = TopologicalDAGDecoder(
         lambda_intron=args.lambda_intron,
         max_exons=args.max_exons,
@@ -199,7 +200,7 @@ def cmd_predict(args):
     raw_all = fwd_genes_raw + rev_genes
     print(f"[*] Total Candidates Before Conflict Resolution: {len(raw_all)}")
 
-    all_preds = DualStrandResolver.resolve_conflicts(raw_all, max_reciprocal_overlap=0.35)
+    all_preds = DualStrandResolver.resolve_conflicts(raw_all, max_reciprocal_overlap=0.15)
     print(f"[+] Final Discovered Gene Models: {len(all_preds)} in {time.time()-t0:.1f}s")
 
     if args.stratify_te:
@@ -235,7 +236,7 @@ def main():
     p_pred.add_argument("--checkpoint", default=None, help="Path to backbone .pt weights")
     p_pred.add_argument("--device", default=None, help="Compute device ('cuda', 'mps', 'cpu')")
     p_pred.add_argument("--lambda_intron", type=float, default=4.5, help="Splicing log-odds penalty (default: 4.5)")
-    p_pred.add_argument("--max_exons", type=int, default=8, help="Maximum exon depth in DAG (default: 8)")
+    p_pred.add_argument("--max_exons", type=int, default=16, help="Maximum exon depth in DAG (default: 16)")
     p_pred.add_argument("--energy_cutoff", type=float, default=13.0, help="ESM-2 free energy cutoff (default: 13.0)")
     p_pred.add_argument("--stratify_te", action="store_true", default=True, help="Stratify output into host vs transposon-derived genes (default: True)")
     p_pred.add_argument("--no_stratify_te", action="store_false", dest="stratify_te", help="Disable TE classification")

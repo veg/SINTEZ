@@ -121,20 +121,27 @@ class ProteinEnergyOracle:
         _, _, batch_tokens = self.batch_converter(data)
         batch_tokens = batch_tokens.to(self.device)
 
-        # 3. Compute ESM-2 Evolutionary Pseudo-Log-Likelihood
+        # 3. Compute ESM-2 Evolutionary Pseudo-Log-Likelihood & Local Windowed Profile
         try:
             results = self.esm_model(batch_tokens, return_contacts=False)
             logits = results["logits"]  # (1, seq_len + 2, alphabet_size)
             
             # Extract target tokens (skipping <cls> at pos 0 and <eos> at pos -1)
-            target = batch_tokens[:, 1:-1]
-            pred_logits = logits[:, 1:-1, :]
+            target = batch_tokens[0, 1 : 1 + len(esm_seq)]
+            pred_logits = logits[0, 1 : 1 + len(esm_seq), :]
             
-            loss_fn = nn.CrossEntropyLoss(reduction="mean")
-            esm_loss = loss_fn(pred_logits.reshape(-1, pred_logits.size(-1)), target.reshape(-1)).item()
+            loss_vec = nn.CrossEntropyLoss(reduction="none")(pred_logits, target)
+            esm_loss = float(loss_vec.mean().item())
+            if len(esm_seq) >= 12:
+                w_losses = loss_vec.unfold(0, 12, 1).mean(dim=1)
+                peak_12_nll = float(w_losses.max().item())
+            else:
+                peak_12_nll = esm_loss
+            n_term_nll = float(loss_vec[: min(15, len(esm_seq))].mean().item())
         except Exception:
-            # Fallback for unexpected edge cases
             esm_loss = 25.0
+            peak_12_nll = 25.0
+            n_term_nll = 25.0
 
         # 4. Information-Theoretic Sequence Complexity
         shannon_h = self.calculate_shannon_entropy(clean_seq)
@@ -146,6 +153,8 @@ class ProteinEnergyOracle:
         res = {
             "total_energy": float(total_energy),
             "esm_cross_entropy": float(esm_loss),
+            "peak_window_nll": float(peak_12_nll),
+            "n_term_nll": float(n_term_nll),
             "shannon_entropy": float(shannon_h),
             "entropy_penalty": float(entropy_cost),
             "ptc_penalty": float(ptc_cost),
@@ -155,6 +164,178 @@ class ProteinEnergyOracle:
         }
         self._cache[raw_protein_seq] = res
         return res
+
+    @torch.no_grad()
+    def score_masked_profile(
+        self,
+        raw_protein_seq: str,
+        junction_aa_indices: Optional[List[int]] = None,
+        disputed_aa_ranges: Optional[List[Tuple[int, int]]] = None,
+    ) -> Dict[str, float]:
+        """
+        Computes leakage-free Masked Language Model NLL over splice-junction collars
+        (+-4 AA around each splice boundary) and any disputed sequence regions (e.g.
+        retained introns or N-terminal extensions) in a single 2-row interleaved forward pass.
+        """
+        clean_seq = raw_protein_seq.rstrip("*")
+        esm_seq = clean_seq.replace("*", "X")[:1022]
+        L = len(esm_seq)
+        if L == 0:
+            return {
+                "masked_junc_nll": 25.0,
+                "masked_peak_nll": 25.0,
+            }
+
+        target_positions = set()
+        if junction_aa_indices:
+            for j in junction_aa_indices:
+                for pos in range(max(0, j - 4), min(L, j + 4)):
+                    target_positions.add(pos)
+        if disputed_aa_ranges:
+            for r_s, r_e in disputed_aa_ranges:
+                for pos in range(max(0, r_s), min(L, r_e)):
+                    target_positions.add(pos)
+
+        if not target_positions:
+            base = self.score_sequence(raw_protein_seq)
+            return {
+                "masked_junc_nll": base["esm_cross_entropy"],
+                "masked_peak_nll": base.get("peak_window_nll", base["esm_cross_entropy"]),
+            }
+
+        pos_list = sorted(target_positions)
+        cache_key = (esm_seq, tuple(pos_list))
+        if not hasattr(self, "_collar_cache"):
+            self._collar_cache: Dict[Tuple[str, Tuple[int, ...]], Dict[str, float]] = {}
+        if cache_key in self._collar_cache:
+            return self._collar_cache[cache_key]
+
+        try:
+            _, _, tok = self.batch_converter([("p", esm_seq)])
+            tok = tok.to(self.device)
+            mask_idx = self.alphabet.mask_idx
+            # 2-row interleaved mask so adjacent residues inside the collar remain unmasked context
+            batch = tok.repeat(2, 1)
+            for idx_p, pos in enumerate(pos_list):
+                batch[idx_p % 2, 1 + pos] = mask_idx
+            logits = self.esm_model(batch, return_contacts=False)["logits"]
+            loss_fn = nn.CrossEntropyLoss(reduction="none")
+            vals = []
+            for idx_p, pos in enumerate(pos_list):
+                r = idx_p % 2
+                v = float(loss_fn(logits[r, 1 + pos : 2 + pos, :], tok[0, 1 + pos : 2 + pos]).item())
+                vals.append(v)
+            mean_collar = sum(vals) / len(vals)
+            if len(vals) >= 6:
+                peak_collar = max(sum(vals[k : k + 6]) / 6.0 for k in range(len(vals) - 5))
+            else:
+                peak_collar = max(vals)
+            res = {
+                "masked_junc_nll": float(mean_collar),
+                "masked_peak_nll": float(peak_collar),
+            }
+        except Exception:
+            res = {"masked_junc_nll": 3.5, "masked_peak_nll": 4.0}
+
+        self._collar_cache[cache_key] = res
+        return res
+
+    @torch.no_grad()
+    def score_masked_profiles_batch(
+        self,
+        requests: List[Tuple[str, Optional[List[int]], Optional[List[Tuple[int, int]]]]],
+        batch_size: int = 8,
+    ) -> List[Dict[str, float]]:
+        """
+        Pre-warms `_collar_cache` using length-sorted batched 2-row interleaved ESM-2
+        forward passes, then returns the exact `score_masked_profile` results.
+        """
+        if not hasattr(self, "_collar_cache"):
+            self._collar_cache = {}
+
+        uncached = []
+        seen_keys = set()
+        for raw_protein_seq, junction_aa_indices, disputed_aa_ranges in requests:
+            clean_seq = raw_protein_seq.rstrip("*")
+            esm_seq = clean_seq.replace("*", "X")[:1022]
+            L = len(esm_seq)
+            if L == 0:
+                continue
+            target_positions = set()
+            if junction_aa_indices:
+                for j in junction_aa_indices:
+                    for pos in range(max(0, j - 4), min(L, j + 4)):
+                        target_positions.add(pos)
+            if disputed_aa_ranges:
+                for r_s, r_e in disputed_aa_ranges:
+                    for pos in range(max(0, r_s), min(L, r_e)):
+                        target_positions.add(pos)
+            if not target_positions:
+                continue
+            pos_tuple = tuple(sorted(target_positions))
+            cache_key = (esm_seq, pos_tuple)
+            if cache_key not in self._collar_cache and cache_key not in seen_keys:
+                seen_keys.add(cache_key)
+                uncached.append((esm_seq, pos_tuple, cache_key))
+
+        if uncached:
+            uncached.sort(key=lambda x: len(x[0]))
+            mask_idx = self.alphabet.mask_idx
+            loss_fn = nn.CrossEntropyLoss(reduction="none")
+
+            for i in range(0, len(uncached), batch_size):
+                chunk = uncached[i : i + batch_size]
+                data = [(f"m_{j}", item[0]) for j, item in enumerate(chunk)]
+                try:
+                    _, _, tok_batch = self.batch_converter(data)
+                    tok_batch = tok_batch.to(self.device)
+                    batch = tok_batch.repeat_interleave(2, dim=0)
+
+                    row_indices = []
+                    col_indices = []
+                    target_toks = []
+                    item_slices = []
+                    cur_off = 0
+
+                    for j, (_, pos_tuple, _) in enumerate(chunk):
+                        base_r = 2 * j
+                        for idx_p, pos in enumerate(pos_tuple):
+                            r = base_r + (idx_p % 2)
+                            c = 1 + pos
+                            batch[r, c] = mask_idx
+                            row_indices.append(r)
+                            col_indices.append(c)
+                            target_toks.append(tok_batch[j, c])
+                        next_off = cur_off + len(pos_tuple)
+                        item_slices.append((cur_off, next_off))
+                        cur_off = next_off
+
+                    logits = self.esm_model(batch, return_contacts=False)["logits"]
+                    r_t = torch.tensor(row_indices, dtype=torch.long, device=self.device)
+                    c_t = torch.tensor(col_indices, dtype=torch.long, device=self.device)
+                    tgt_t = torch.stack(target_toks)
+                    all_losses = loss_fn(logits[r_t, c_t, :], tgt_t).detach().cpu().tolist()
+
+                    for j, (_, _, cache_key) in enumerate(chunk):
+                        s_i, e_i = item_slices[j]
+                        vals = all_losses[s_i:e_i]
+                        mean_collar = sum(vals) / len(vals)
+                        if len(vals) >= 6:
+                            peak_collar = max(sum(vals[k : k + 6]) / 6.0 for k in range(len(vals) - 5))
+                        else:
+                            peak_collar = max(vals)
+                        self._collar_cache[cache_key] = {
+                            "masked_junc_nll": float(mean_collar),
+                            "masked_peak_nll": float(peak_collar),
+                        }
+                except Exception:
+                    # Individual calls will populate cache lazily via fallback
+                    pass
+
+        return [
+            self.score_masked_profile(raw_seq, j_aa, d_rng)
+            for raw_seq, j_aa, d_rng in requests
+        ]
 
     @torch.no_grad()
     def score_transcript(self, tx) -> Dict[str, float]:
@@ -184,6 +365,8 @@ class ProteinEnergyOracle:
         return {
             "total_energy": float(total_energy),
             "esm_cross_entropy": base_scores["esm_cross_entropy"],
+            "peak_window_nll": base_scores.get("peak_window_nll", base_scores["esm_cross_entropy"]),
+            "n_term_nll": base_scores.get("n_term_nll", base_scores["esm_cross_entropy"]),
             "entropy_penalty": float(entropy_cost),
             "frame_penalty": frame_cost,
             "start_penalty": start_cost,
@@ -228,7 +411,13 @@ class ProteinEnergyOracle:
                     seq_len = len(esm_seq)
                     target_j = batch_tokens[j, 1 : 1 + seq_len]
                     logits_j = logits[j, 1 : 1 + seq_len, :]
-                    esm_loss = loss_fn(logits_j, target_j).mean().item()
+                    loss_vec = loss_fn(logits_j, target_j)
+                    esm_loss = float(loss_vec.mean().item())
+                    if seq_len >= 12:
+                        peak_12_nll = float(loss_vec.unfold(0, 12, 1).mean(dim=1).max().item())
+                    else:
+                        peak_12_nll = esm_loss
+                    n_term_nll = float(loss_vec[: min(15, seq_len)].mean().item())
 
                     has_internal_stop = "*" in clean_seq
                     ptc_cost = self.ptc_penalty if has_internal_stop else 0.0
@@ -241,6 +430,8 @@ class ProteinEnergyOracle:
                     self._cache[raw_seq] = {
                         "total_energy": float(total_energy),
                         "esm_cross_entropy": float(esm_loss),
+                        "peak_window_nll": float(peak_12_nll),
+                        "n_term_nll": float(n_term_nll),
                         "shannon_entropy": float(shannon_h),
                         "entropy_penalty": float(entropy_cost),
                         "ptc_penalty": float(ptc_cost),

@@ -113,11 +113,15 @@ class CounterfactualDataset(Dataset):
         samples: List[GenomicGeneSample],
         generate_negatives: bool = False,
         bucket_step: Optional[int] = None,
+        boundary_sigma: float = 1.0,
+        boundary_radius: int = 2,
     ):
         self.samples = samples
         self.operator = SplicedTranslationOperator()
         self.generate_negatives = generate_negatives
         self.bucket_step = bucket_step
+        self.boundary_sigma = boundary_sigma
+        self.boundary_radius = boundary_radius
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -200,8 +204,8 @@ class CounterfactualDataset(Dataset):
                 if 0 <= intron_start < intron_end <= L:
                     target_span[intron_start:intron_end] = 1
                     target_span_7class[intron_start:intron_end] = 1
-                apply_gaussian_smoothing(target_donor, intron_start, sigma=1.0, radius=2)
-                apply_gaussian_smoothing(target_acceptor, intron_end - 1, sigma=1.0, radius=2)
+                apply_gaussian_smoothing(target_donor, intron_start, sigma=self.boundary_sigma, radius=self.boundary_radius)
+                apply_gaussian_smoothing(target_acceptor, intron_end - 1, sigma=self.boundary_sigma, radius=self.boundary_radius)
 
             cum_cds = 0
             for s, e in g_spans:
@@ -216,8 +220,8 @@ class CounterfactualDataset(Dataset):
 
             s_first = g_spans[0][0]
             e_last = g_spans[-1][1]
-            apply_gaussian_smoothing(target_start, s_first, sigma=1.0, radius=2)
-            apply_gaussian_smoothing(target_stop, e_last - 3, sigma=1.0, radius=2)
+            apply_gaussian_smoothing(target_start, s_first, sigma=self.boundary_sigma, radius=self.boundary_radius)
+            apply_gaussian_smoothing(target_stop, e_last - 3, sigma=self.boundary_sigma, radius=self.boundary_radius)
 
             if 0 <= s_first and s_first + 3 <= L:
                 target_span_7class[s_first : s_first + 3] = 5
