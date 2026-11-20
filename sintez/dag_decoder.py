@@ -124,6 +124,8 @@ class TopologicalDAGDecoder:
         preds: Dict[str, np.ndarray],
         oracle: ProteinEnergyOracle,
         strand_label: str = "+",
+        antisense_coding: Optional[np.ndarray] = None,
+        export_collector: Optional[Dict] = None,
     ) -> List[Dict]:
         """
         Decodes gene models on a 5'->3' sequence using principled log-odds DAG search
@@ -140,9 +142,17 @@ class TopologicalDAGDecoder:
         coding_p = preds["coding"]
 
         # 1. Prefix-sum arrays for O(1) log-odds and coding probability integration
-        # Empirical background calibration: adapts neutral point and active coding scale dynamically to regime
-        p30_est = float(np.percentile(coding_p, 30.0)) if L > 1000 else 0.15
-        p85_est = float(np.percentile(coding_p, 85.0)) if L > 1000 else 0.70
+        # Empirical background calibration: filter out high-copy TE/repeat regions via canonical 17-mer depths
+        depths_17: Optional[np.ndarray] = None
+        if L > 1000:
+            depths_17 = _compute_canon_17mer_depths(dna_upper)
+            non_rep_mask = depths_17 < 5
+            cal_cod = coding_p[non_rep_mask] if int(np.count_nonzero(non_rep_mask)) >= max(500, L // 4) else coding_p
+            p30_est = float(np.percentile(cal_cod, 30.0))
+            p85_est = float(np.percentile(cal_cod, 85.0))
+        else:
+            p30_est = 0.15
+            p85_est = 0.70
         cod_scale = min(1.0, max(0.25, p85_est / 0.65))
         p0 = max(0.025, min(p30_est, 0.35, p85_est * 0.28))
         llr_offset = math.log(p0 / (1.0 - p0))
@@ -191,6 +201,83 @@ class TopologicalDAGDecoder:
             if not has_fold or e <= s:
                 return 0.0
             return float(cumsum_fold[e] - cumsum_fold[s]) / (e - s)
+
+        # Optional 3-state intron vs intergenic tracks + stop/start gene-break counters for long introns
+        intron_p = preds.get("intron")
+        inter_p = preds.get("intergenic")
+        has_3state = (
+            intron_p is not None
+            and inter_p is not None
+            and len(intron_p) == L
+            and len(inter_p) == L
+        )
+        cumsum_intr = np.zeros(L + 1, dtype=np.float64)
+        cumsum_inter = np.zeros(L + 1, dtype=np.float64)
+        if has_3state:
+            cumsum_intr[1:] = np.cumsum(intron_p)
+            cumsum_inter[1:] = np.cumsum(inter_p)
+
+        cumsum_strong_stop = np.zeros(L + 1, dtype=np.int32)
+        cumsum_strong_start = np.zeros(L + 1, dtype=np.int32)
+        cumsum_strong_stop[1:] = np.cumsum((stop_p >= 0.45).astype(np.int32))
+        cumsum_strong_start[1:] = np.cumsum((start_p >= 0.45).astype(np.int32))
+
+        def get_intron_state_means(s: int, e: int) -> Tuple[float, float]:
+            if not has_3state or e <= s:
+                return 0.0, 0.0
+            inv_l = 1.0 / (e - s)
+            return float((cumsum_intr[e] - cumsum_intr[s]) * inv_l), float((cumsum_inter[e] - cumsum_inter[s]) * inv_l)
+
+        def has_intervening_gene_break(d: int, a: int) -> bool:
+            if (a - d) <= self.max_intron_len or (a - d) < 35:
+                return False
+            lo_b = d + 15
+            hi_b = a - 15
+            if hi_b <= lo_b:
+                return False
+            n_st = int(cumsum_strong_stop[hi_b] - cumsum_strong_stop[lo_b])
+            n_atg = int(cumsum_strong_start[hi_b] - cumsum_strong_start[lo_b])
+            return n_st > 0 and n_atg > 0
+
+        def _boundary_chain_prob(spans: List[Tuple[int, int]]) -> Tuple[float, List[float]]:
+            if not spans:
+                return 0.0, []
+            p_start = min(0.98, max(0.30, 0.35 + 0.63 * float(start_p[spans[0][0]])))
+            e_last = spans[-1][1]
+            s_stop = float(stop_p[e_last - 3]) if 3 <= e_last <= L + 2 and (e_last - 3) < L else 0.5
+            p_stop = min(0.99, max(0.40, 0.52 + 0.47 * s_stop))
+            ex_b_probs: List[float] = []
+            for idx_e, (es, ee) in enumerate(spans):
+                left_p = (
+                    p_start
+                    if idx_e == 0
+                    else min(0.98, max(0.30, 0.32 + 0.66 * float(accept_p[es - 1])))
+                )
+                right_p = (
+                    p_stop
+                    if idx_e == len(spans) - 1
+                    else min(0.98, max(0.30, 0.32 + 0.66 * float(donor_p[ee])))
+                )
+                ex_b_probs.append(left_p * right_p)
+            chain_b = p_start * p_stop
+            for idx_j in range(len(spans) - 1):
+                d_j = spans[idx_j][1]
+                a_j = spans[idx_j + 1][0]
+                jp = min(0.98, max(0.30, 0.34 + 0.33 * (float(donor_p[d_j]) + float(accept_p[a_j - 1]))))
+                chain_b *= jp ** 0.70
+            return float(chain_b), ex_b_probs
+
+        def _assign_gene_posterior(cand: Dict) -> None:
+            sp = cand["spans"]
+            chain_b, ex_b_probs = _boundary_chain_prob(sp)
+            dna_s = float(cand.get("dna_score", 10.0))
+            sc_s = float(cand.get("score", dna_s - float(cand.get("energy", 0.4)) * 0.30))
+            p_loc_dna = 1.0 / (1.0 + math.exp(-max(-20.0, min(20.0, (dna_s - 8.0) / 5.0))))
+            p_loc_joint = 1.0 / (1.0 + math.exp(-max(-20.0, min(20.0, (sc_s - 6.5) / 4.5))))
+            cand["posterior_pass1"] = round(float(p_loc_dna * chain_b), 4)
+            cand["posterior"] = round(float(p_loc_joint * chain_b), 4)
+            cand["exon_posteriors"] = [round(float(p_loc_joint * eb), 4) for eb in ex_b_probs]
+            cand["tier"] = "high" if cand["posterior"] >= 0.85 else ("medium" if cand["posterior"] >= 0.55 else "low")
 
         # 2. Pre-index stop codons by reading frame phase for O(log N) lookup
         stops_set = {"TAA", "TAG", "TGA"}
@@ -854,8 +941,17 @@ class TopologicalDAGDecoder:
                 masked_cands = [x for x in locus_valid if "masked_junc_nll" in x]
                 min_mjunc = min(x["masked_junc_nll"] for x in masked_cands) if masked_cands else 0.0
                 min_mpeak = min(x["masked_peak_nll"] for x in masked_cands) if masked_cands else 0.0
+                max_dna = max(float(x["dna_score"]) for x in locus_valid)
+                mean_energy = sum(float(x["energy"]) for x in locus_valid) / len(locus_valid)
+                p_loc_dna = 1.0 / (1.0 + math.exp(-max(-20.0, min(20.0, (max_dna - 8.0) / 5.0))))
 
-                for c in locus_valid:
+                w1_raw = [math.exp(max(-30.0, min(0.0, (float(x["dna_score"]) - max_dna) / 6.0))) for x in locus_valid]
+                w1_sum = sum(w1_raw) or 1.0
+                w1_probs = [v / w1_sum for v in w1_raw]
+
+                tie_penalties = []
+                w2_raw = []
+                for idx_c, c in enumerate(locus_valid):
                     tie_break_penalty = 0.0
                     if len(locus_valid) > 1:
                         rel_peak = max(0.0, c["peak_window_nll"] - min_peak - 0.02)
@@ -866,6 +962,24 @@ class TopologicalDAGDecoder:
                                 + (c["masked_peak_nll"] - min_mpeak) * 0.45
                             )
                     c["score"] = c["dna_score"] - c["energy"] * 0.30 - tie_break_penalty
+                    tie_penalties.append(tie_break_penalty)
+                    e_pen = 0.30 * (float(c["energy"]) - mean_energy) + tie_break_penalty
+                    w2_raw.append(w1_probs[idx_c] * math.exp(max(-30.0, min(20.0, -e_pen))))
+
+                w2_sum = sum(w2_raw) or 1.0
+                w2_probs = [v / w2_sum for v in w2_raw]
+
+                for idx_c, c in enumerate(locus_valid):
+                    chain_b, ex_b_probs = _boundary_chain_prob(c["spans"])
+                    p_loc_joint = 1.0 / (1.0 + math.exp(-max(-20.0, min(20.0, (float(c["score"]) - 6.5) / 4.5))))
+                    c["posterior_pass1"] = round(float(p_loc_dna * chain_b * w1_probs[idx_c]), 4)
+                    c["posterior"] = round(float(p_loc_joint * chain_b * w2_probs[idx_c]), 4)
+                    ex_posts = []
+                    for sp_e, eb in zip(c["spans"], ex_b_probs):
+                        ex_mass = sum(w2_probs[j] for j, cj in enumerate(locus_valid) if sp_e in cj["spans"])
+                        ex_posts.append(round(float(p_loc_joint * eb * ex_mass), 4))
+                    c["exon_posteriors"] = ex_posts
+                    c["tier"] = "high" if c["posterior"] >= 0.85 else ("medium" if c["posterior"] >= 0.55 else "low")
                     scored.append(c)
 
         # Final Intra-Strand NMS (ranked by joint dual-space score, suppressing nested/overlapping loci)
@@ -970,6 +1084,10 @@ class TopologicalDAGDecoder:
                     max_bridge_mp = 0.15 if is_1ex_pair else (0.14 if is_long_int else (0.20 if strict_bypass else 0.25))
                     if bridge_int_mp > max_bridge_mp:
                         continue
+                    if has_3state and is_long_int:
+                        bridge_intr_mp, bridge_inter_mp = get_intron_state_means(d_pos, a_pos)
+                        if bridge_inter_mp > bridge_intr_mp:
+                            continue
                     merged_spans = g_left["spans"][:-1] + [(e1_s, d_pos), (a_pos, e2_e)] + g_right["spans"][1:]
                     tx_m = self.operator.process_transcript(seq, merged_spans, strand="+")
                     if not (tx_m.is_in_frame and not tx_m.has_internal_stop):
@@ -1688,7 +1806,8 @@ class TopologicalDAGDecoder:
         # Phase 3: Strand-Calibrated Paralog-Safe Repeat / High-Energy / Weak-ORF Pure-FP Filtering
         # Runs only on genomic scales >= 1000 bp so short synthetic tests are unaffected
         if L >= 1000 and cleaned_retained and has_fold:
-            depths_17 = _compute_canon_17mer_depths(dna_upper)
+            if depths_17 is None:
+                depths_17 = _compute_canon_17mer_depths(dna_upper)
             energies_strand = []
             for c in cleaned_retained:
                 if c.get("energy") is None:
@@ -1743,7 +1862,63 @@ class TopologicalDAGDecoder:
                 )
                 if not (is_repeat_te or is_weak_bio or is_weak_1ex or is_weak_mex):
                     filtered_retained.append(c)
-            return filtered_retained
+            final_out = filtered_retained
+        else:
+            final_out = cleaned_retained
 
-        return cleaned_retained
+        for g in final_out:
+            if len(g.get("exon_posteriors", [])) != len(g["spans"]) or "posterior" not in g:
+                _assign_gene_posterior(g)
+
+        if export_collector is not None:
+            ex_scores: Dict[Tuple[int, int, str], float] = export_collector.setdefault("exon_scores", {})
+            in_scores: Dict[Tuple[int, int], float] = export_collector.setdefault("intron_scores", {})
+            for cand_list in (dna_retained, final_out):
+                for c in cand_list:
+                    sp = c["spans"]
+                    n_sp = len(sp)
+                    for idx_e, (es, ee) in enumerate(sp):
+                        if n_sp == 1:
+                            etype = "single"
+                        elif idx_e == 0:
+                            etype = "initial"
+                        elif idx_e == n_sp - 1:
+                            etype = "terminal"
+                        else:
+                            etype = "internal"
+                        cod_llr = (float(cumsum_llr[ee]) - float(cumsum_llr[es])) * 0.25
+                        left_p = float(start_p[es]) if idx_e == 0 else float(accept_p[es - 1])
+                        right_p = (
+                            float(stop_p[ee - 3]) if 3 <= ee <= L + 2 and (ee - 3) < L else 0.5
+                        ) if idx_e == n_sp - 1 else float(donor_p[ee])
+                        b_llr = math.log(min(0.999, max(1e-3, left_p)) / 0.05) + math.log(
+                            min(0.999, max(1e-3, right_p)) / 0.05
+                        )
+                        val = cod_llr + b_llr
+                        key = (es, ee, etype)
+                        if key not in ex_scores or val > ex_scores[key]:
+                            ex_scores[key] = float(val)
+                    for idx_e in range(n_sp - 1):
+                        d_pos = sp[idx_e][1]
+                        a_pos = sp[idx_e + 1][0]
+                        if a_pos <= d_pos + 3:
+                            continue
+                        d_sc = float(donor_p[d_pos])
+                        a_sc = float(accept_p[a_pos - 1])
+                        _, int_mp = get_exon_metrics(d_pos, a_pos)
+                        illr = (
+                            math.log(1.0 + 50.0 * d_sc)
+                            + math.log(1.0 + 50.0 * a_sc)
+                            - self.lambda_intron
+                            - 3.0 * int_mp
+                        )
+                        if has_3state:
+                            m_intr, m_inter = get_intron_state_means(d_pos, a_pos)
+                            illr += 1.5 * (m_intr - m_inter)
+                        if illr > 0.0:
+                            ikey = (d_pos, a_pos)
+                            if ikey not in in_scores or illr > in_scores[ikey]:
+                                in_scores[ikey] = float(illr)
+
+        return final_out
 

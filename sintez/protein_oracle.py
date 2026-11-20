@@ -75,6 +75,129 @@ class ProteinEnergyOracle:
         n = len(seq)
         return -sum((c / n) * math.log2(c / n) for c in counts.values())
 
+    @staticmethod
+    def low_complexity_mask(seq: str, window: int = 12, threshold: float = 2.2) -> List[bool]:
+        """
+        Identifies local low-complexity amino-acid regions using a sliding-window Shannon entropy threshold.
+        Returns a per-residue boolean list matching len(seq) where True marks low-complexity positions.
+        """
+        n = len(seq)
+        if n == 0:
+            return []
+        if n < window:
+            is_lc = ProteinEnergyOracle.calculate_shannon_entropy(seq) < threshold
+            return [is_lc] * n
+
+        mask = [False] * n
+        counts: Dict[str, int] = {}
+        for ch in seq[:window]:
+            counts[ch] = counts.get(ch, 0) + 1
+
+        inv_w = 1.0 / window
+        for i in range(n - window + 1):
+            h = -sum((c * inv_w) * math.log2(c * inv_w) for c in counts.values())
+            if h < threshold:
+                for k in range(i, i + window):
+                    mask[k] = True
+            if i + window < n:
+                out_ch = seq[i]
+                if counts[out_ch] == 1:
+                    del counts[out_ch]
+                else:
+                    counts[out_ch] -= 1
+                in_ch = seq[i + window]
+                counts[in_ch] = counts.get(in_ch, 0) + 1
+        return mask
+
+    @staticmethod
+    def globular_core_entropy(seq: str, window: int = 45) -> float:
+        """
+        Returns the maximum Shannon entropy observed across sliding windows of `window` residues.
+        Captures whether a sequence with low-complexity tails/linkers still contains a complex globular core.
+        """
+        n = len(seq)
+        if n == 0:
+            return 0.0
+        if n <= window:
+            return ProteinEnergyOracle.calculate_shannon_entropy(seq)
+
+        counts: Dict[str, int] = {}
+        for ch in seq[:window]:
+            counts[ch] = counts.get(ch, 0) + 1
+
+        inv_w = 1.0 / window
+        best_h = 0.0
+        for i in range(n - window + 1):
+            h = -sum((c * inv_w) * math.log2(c * inv_w) for c in counts.values())
+            if h > best_h:
+                best_h = h
+            if i + window < n:
+                out_ch = seq[i]
+                if counts[out_ch] == 1:
+                    del counts[out_ch]
+                else:
+                    counts[out_ch] -= 1
+                in_ch = seq[i + window]
+                counts[in_ch] = counts.get(in_ch, 0) + 1
+        return float(best_h)
+
+    def _finalize_sequence_energy(
+        self,
+        clean_seq: str,
+        esm_loss: float,
+        peak_12_nll: float,
+        n_term_nll: float,
+        loss_vec: Optional[torch.Tensor] = None,
+    ) -> Dict[str, float]:
+        """Combines ESM-2 perplexity, ORF validity, and low-complexity-aware entropy into a cached summary dict."""
+        has_internal_stop = "*" in clean_seq
+        ptc_cost = self.ptc_penalty if has_internal_stop else 0.0
+        length = len(clean_seq)
+        len_cost = float(max(0, self.min_length - length)) * self.short_penalty
+
+        shannon_h = self.calculate_shannon_entropy(clean_seq)
+        lc_mask = self.low_complexity_mask(clean_seq, window=12, threshold=2.2)
+        n_lc = sum(lc_mask)
+        f_lc = float(n_lc) / float(length) if length > 0 else 1.0
+        non_lc_residues = length - n_lc
+        core_h = self.globular_core_entropy(clean_seq, window=45)
+
+        has_globular_core = (core_h >= 3.25) and (non_lc_residues >= 45) and (f_lc <= 0.70)
+        entropy_cost = 0.0 if has_globular_core else float(max(0.0, 3.2 - shannon_h) * 8.0)
+
+        globular_esm_loss = float(esm_loss)
+        eff_esm_loss = float(esm_loss)
+        if has_globular_core and loss_vec is not None and len(loss_vec) > 0:
+            esm_len = int(loss_vec.shape[0])
+            non_lc_indices = [idx for idx in range(esm_len) if not lc_mask[idx]]
+            if len(non_lc_indices) >= 15 and n_lc > 0:
+                idx_t = torch.tensor(non_lc_indices, dtype=torch.long, device=loss_vec.device)
+                globular_esm_loss = float(loss_vec.index_select(0, idx_t).mean().item())
+                blend = 0.5 * f_lc
+                eff_esm_loss = min(
+                    float(esm_loss),
+                    (1.0 - blend) * float(esm_loss) + blend * globular_esm_loss,
+                )
+
+        total_energy = eff_esm_loss + ptc_cost + len_cost + entropy_cost
+        return {
+            "total_energy": float(total_energy),
+            "esm_cross_entropy": float(esm_loss),
+            "globular_esm_nll": float(globular_esm_loss),
+            "peak_window_nll": float(peak_12_nll),
+            "n_term_nll": float(n_term_nll),
+            "shannon_entropy": float(shannon_h),
+            "core_entropy": float(core_h),
+            "f_lc": float(f_lc),
+            "has_globular_core": bool(has_globular_core),
+            "entropy_penalty": float(entropy_cost),
+            "ptc_penalty": float(ptc_cost),
+            "length_penalty": float(len_cost),
+            "is_valid_orf": (not has_internal_stop) and (length >= self.min_length),
+            "length": length,
+            "oracle_schema": 2,
+        }
+
     @torch.no_grad()
     def score_sequence(self, raw_protein_seq: str) -> Dict[str, float]:
         """
@@ -91,8 +214,9 @@ class ProteinEnergyOracle:
                 - 'length_penalty': Length deficit penalty.
                 - 'is_valid_orf': Boolean whether sequence contains no internal stops.
         """
-        if raw_protein_seq in self._cache:
-            return self._cache[raw_protein_seq]
+        cached = self._cache.get(raw_protein_seq)
+        if cached is not None and cached.get("oracle_schema") == 2:
+            return cached
 
         clean_seq = raw_protein_seq.rstrip("*")
         
@@ -106,14 +230,25 @@ class ProteinEnergyOracle:
         len_cost = float(length_deficit) * self.short_penalty
         
         if length == 0:
-            return {
+            res = {
                 "total_energy": 500.0,
                 "esm_cross_entropy": 50.0,
+                "globular_esm_nll": 50.0,
+                "peak_window_nll": 50.0,
+                "n_term_nll": 50.0,
+                "shannon_entropy": 0.0,
+                "core_entropy": 0.0,
+                "f_lc": 1.0,
+                "has_globular_core": False,
+                "entropy_penalty": 0.0,
                 "ptc_penalty": ptc_cost,
                 "length_penalty": len_cost,
                 "is_valid_orf": False,
                 "length": 0,
+                "oracle_schema": 2,
             }
+            self._cache[raw_protein_seq] = res
+            return res
 
         # Remove any internal asterisks and cap at ESM-2 1022-residue context limit
         esm_seq = clean_seq.replace("*", "X")[:1022]
@@ -122,6 +257,7 @@ class ProteinEnergyOracle:
         batch_tokens = batch_tokens.to(self.device)
 
         # 3. Compute ESM-2 Evolutionary Pseudo-Log-Likelihood & Local Windowed Profile
+        loss_vec: Optional[torch.Tensor] = None
         try:
             results = self.esm_model(batch_tokens, return_contacts=False)
             logits = results["logits"]  # (1, seq_len + 2, alphabet_size)
@@ -143,25 +279,9 @@ class ProteinEnergyOracle:
             peak_12_nll = 25.0
             n_term_nll = 25.0
 
-        # 4. Information-Theoretic Sequence Complexity
-        shannon_h = self.calculate_shannon_entropy(clean_seq)
-        complexity_deficit = max(0.0, 3.2 - shannon_h)
-        entropy_cost = float(complexity_deficit * 8.0)
-
-        total_energy = esm_loss + ptc_cost + len_cost + entropy_cost
-
-        res = {
-            "total_energy": float(total_energy),
-            "esm_cross_entropy": float(esm_loss),
-            "peak_window_nll": float(peak_12_nll),
-            "n_term_nll": float(n_term_nll),
-            "shannon_entropy": float(shannon_h),
-            "entropy_penalty": float(entropy_cost),
-            "ptc_penalty": float(ptc_cost),
-            "length_penalty": float(len_cost),
-            "is_valid_orf": (not has_internal_stop) and (length >= self.min_length),
-            "length": length,
-        }
+        res = self._finalize_sequence_energy(
+            clean_seq, esm_loss, peak_12_nll, n_term_nll, loss_vec=loss_vec
+        )
         self._cache[raw_protein_seq] = res
         return res
 
@@ -386,7 +506,8 @@ class ProteinEnergyOracle:
         uncached = []
         seen = set()
         for seq in sequences:
-            if seq not in self._cache and seq not in seen:
+            cached = self._cache.get(seq)
+            if (cached is None or cached.get("oracle_schema") != 2) and seq not in seen:
                 seen.add(seq)
                 clean = seq.rstrip("*")
                 if len(clean) == 0:
@@ -419,26 +540,9 @@ class ProteinEnergyOracle:
                         peak_12_nll = esm_loss
                     n_term_nll = float(loss_vec[: min(15, seq_len)].mean().item())
 
-                    has_internal_stop = "*" in clean_seq
-                    ptc_cost = self.ptc_penalty if has_internal_stop else 0.0
-                    full_len = len(clean_seq)
-                    len_cost = float(max(0, self.min_length - full_len)) * self.short_penalty
-                    shannon_h = self.calculate_shannon_entropy(clean_seq)
-                    entropy_cost = float(max(0.0, 3.2 - shannon_h) * 8.0)
-                    total_energy = esm_loss + ptc_cost + len_cost + entropy_cost
-
-                    self._cache[raw_seq] = {
-                        "total_energy": float(total_energy),
-                        "esm_cross_entropy": float(esm_loss),
-                        "peak_window_nll": float(peak_12_nll),
-                        "n_term_nll": float(n_term_nll),
-                        "shannon_entropy": float(shannon_h),
-                        "entropy_penalty": float(entropy_cost),
-                        "ptc_penalty": float(ptc_cost),
-                        "length_penalty": float(len_cost),
-                        "is_valid_orf": (not has_internal_stop) and (full_len >= self.min_length),
-                        "length": full_len,
-                    }
+                    self._cache[raw_seq] = self._finalize_sequence_energy(
+                        clean_seq, esm_loss, peak_12_nll, n_term_nll, loss_vec=loss_vec
+                    )
             except Exception:
                 # Fallback to single-sequence evaluation on error
                 for raw_seq, _, _ in chunk:
